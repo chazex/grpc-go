@@ -45,7 +45,8 @@ func NewBalancer(cc balancer.ClientConn, opts balancer.BuildOptions) *Balancer {
 // a new balancer. It implements the balancer.Balancer interface.
 type Balancer struct {
 	bOpts balancer.BuildOptions
-	cc    balancer.ClientConn
+	// 这里的cc是*ccBalancerWrapper
+	cc balancer.ClientConn
 
 	// mu protects the following fields and all fields within balancerCurrent
 	// and balancerPending. mu does not need to be held when calling into the
@@ -110,16 +111,22 @@ func (gsb *Balancer) SwitchTo(builder balancer.Builder) error {
 	}
 	balToClose := gsb.balancerPending // nil if there is no pending balancer
 	if gsb.balancerCurrent == nil {
+		// 如果当前balancer为nil，这将当前balancer指向新的*balancerWrapper. 这一般实在第一次初始化的时候
 		gsb.balancerCurrent = bw
 	} else {
+		// 如果当前balancer不为nil，则将新的*balancerWrapper,指向pending
+		// 疑问：什么时候交换Pending和Current呢?
 		gsb.balancerPending = bw
 	}
 	gsb.mu.Unlock()
 	balToClose.Close()
+
+	//调用balancer.Builder.Build()方法，构建balancer
 	// This function takes a builder instead of a balancer because builder.Build
 	// can call back inline, and this utility needs to handle the callbacks.
 	newBalancer := builder.Build(bw, gsb.bOpts)
 	if newBalancer == nil {
+		// 构建失败
 		// This is illegal and should never happen; we clear the balancerWrapper
 		// we were constructing if it happens to avoid a potential panic.
 		gsb.mu.Lock()
@@ -151,13 +158,19 @@ func (gsb *Balancer) latestBalancer() *balancerWrapper {
 	return gsb.balancerCurrent
 }
 
+// 参数state中包含resolver获取到的地址列表 state.ResolverState
+
 // UpdateClientConnState forwards the update to the latest balancer created.
 func (gsb *Balancer) UpdateClientConnState(state balancer.ClientConnState) error {
+	// 获取最新的balancer实现，这个实现是被*balancerWrapper包装过的。
 	// The resolver data is only relevant to the most recent LB Policy.
 	balToUpdate := gsb.latestBalancer()
 	if balToUpdate == nil {
 		return errBalancerClosed
 	}
+
+	// *balancerWrapper自己没有实现UpdateClientConnState方法，这里调用的是*balancerWrapper里面包装的具体的balancer的UpdateClientConnState()方法。比如*baseBalancer
+	// *balancerWrapper.Balancer的赋值是发生在SwitchTo事件中，此事件通过全局balancer.Builder表，获取到balancer.Builder，并创建balancer。
 	// Perform this call without gsb.mu to prevent deadlocks if the child calls
 	// back into the channel. The latest balancer can never be closed during a
 	// call from the channel, even without gsb.mu held.
@@ -329,12 +342,14 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 
 func (bw *balancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
 	bw.gsb.mu.Lock()
+	// 既不是Current 也不是 Pending，那么这个应该是过期的
 	if !bw.gsb.balancerCurrentOrPending(bw) {
 		bw.gsb.mu.Unlock()
 		return nil, fmt.Errorf("%T at address %p that called NewSubConn is deleted", bw, bw)
 	}
 	bw.gsb.mu.Unlock()
 
+	// 建立连接, bw.gsb.cc.NewSubConn()，实际上调用的是ccBalancerWrapper.NewSubConn()。返回的是*acBalancerWrapper,他内部包含*addrConn
 	sc, err := bw.gsb.cc.NewSubConn(addrs, opts)
 	if err != nil {
 		return nil, err
@@ -345,6 +360,7 @@ func (bw *balancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer.Ne
 		bw.gsb.mu.Unlock()
 		return nil, fmt.Errorf("%T at address %p that called NewSubConn is deleted", bw, bw)
 	}
+	// 保留一份*acBalancerWrapper
 	bw.subconns[sc] = true
 	bw.gsb.mu.Unlock()
 	return sc, nil

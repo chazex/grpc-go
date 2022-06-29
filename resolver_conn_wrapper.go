@@ -91,6 +91,8 @@ func (ccr *ccResolverWrapper) close() {
 	ccr.resolverMu.Unlock()
 }
 
+// 参数时resolver得到的服务地址列表，以及负载均衡配置
+
 func (ccr *ccResolverWrapper) UpdateState(s resolver.State) error {
 	ccr.incomingMu.Lock()
 	defer ccr.incomingMu.Unlock()

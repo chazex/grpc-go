@@ -48,6 +48,8 @@ type lbConfig struct {
 	cfg  serviceconfig.LoadBalancingConfig
 }
 
+// 已经过时了，应该通过State来传递ServiceConfig
+
 // ServiceConfig is provided by the service provider and contains parameters for how
 // clients that connect to the service should behave.
 //

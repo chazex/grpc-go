@@ -53,8 +53,9 @@ type dialOptions struct {
 	chainUnaryInts  []UnaryClientInterceptor
 	chainStreamInts []StreamClientInterceptor
 
-	cp                          Compressor
-	dc                          Decompressor
+	cp Compressor
+	dc Decompressor
+	// 连接失败的回退策略
 	bs                          internalbackoff.Strategy
 	block                       bool
 	returnLastError             bool

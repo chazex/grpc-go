@@ -26,6 +26,8 @@ const scheme = "passthrough"
 
 type passthroughBuilder struct{}
 
+// cc resolver.ClientConn 是 ccResolverWrapper
+
 func (*passthroughBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
 	r := &passthroughResolver{
 		target: target,
@@ -45,6 +47,7 @@ type passthroughResolver struct {
 }
 
 func (r *passthroughResolver) start() {
+	// 这里调用的是ccResolverWrapper的UpdateState方法
 	r.cc.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: r.target.Endpoint}}})
 }
 

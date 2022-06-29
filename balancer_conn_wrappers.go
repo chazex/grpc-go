@@ -103,6 +103,11 @@ type subConnUpdate struct {
 	acbw *acBalancerWrapper
 }
 
+// watcher是一个长时间运行的goroutine，他从channel中读取更新事件，然后调用底层的balancer的对应方法。他确保这些方法以同步的方式被调用,
+// 他也确保这些方法按接收update事件的顺序被调用。
+// 调用底层的balancer的对应方法，调用链是这样: *ccBalancerWrapper包含了*gracefulswitch.Balancer，*gracefulswitch.Balancer
+// 可以获取到当前使用的Balancer（Balancer接口的实现），*balancerWrapper, 然后调用*balancerWrapper的方法
+
 // watcher is a long-running goroutine which reads updates from a channel and
 // invokes corresponding methods on the underlying balancer. It ensures that
 // these methods are invoked in a synchronous fashion. It also ensures that
@@ -125,6 +130,7 @@ func (ccb *ccBalancerWrapper) watcher() {
 			case *resolverErrorUpdate:
 				ccb.handleResolverError(update.err)
 			case *switchToUpdate:
+				// 这块逻辑，仅仅是根据名字创建balancer
 				ccb.handleSwitchTo(update.name)
 			case *subConnUpdate:
 				ccb.handleRemoveSubConn(update.acbw)
@@ -259,6 +265,7 @@ func (ccb *ccBalancerWrapper) handleSwitchTo(name string) {
 		return
 	}
 
+	// 通过名字，从全局balancer表中获取balancer.Builder
 	// TODO: Ensure that name is a registered LB policy when we get here.
 	// We currently only validate the `loadBalancingConfig` field. We need to do
 	// the same for the `loadBalancingPolicy` field and reject the service config
@@ -271,6 +278,7 @@ func (ccb *ccBalancerWrapper) handleSwitchTo(name string) {
 		channelz.Infof(logger, ccb.cc.channelzID, "Channel switches to new LB policy %q", name)
 	}
 
+	// 通过balancer.Builder创建的新的balancer
 	if err := ccb.balancer.SwitchTo(builder); err != nil {
 		channelz.Errorf(logger, ccb.cc.channelzID, "Channel failed to build new LB policy %q: %v", name, err)
 		return
@@ -300,6 +308,7 @@ func (ccb *ccBalancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer
 	if len(addrs) <= 0 {
 		return nil, fmt.Errorf("grpc: cannot create SubConn with empty address list")
 	}
+	// 这里调用的是grpc.ClientConn.newAddrConn
 	ac, err := ccb.cc.newAddrConn(addrs, opts)
 	if err != nil {
 		channelz.Warningf(logger, ccb.cc.channelzID, "acBalancerWrapper: NewSubConn: failed to newAddrConn: %v", err)

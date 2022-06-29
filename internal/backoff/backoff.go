@@ -29,9 +29,13 @@ import (
 	"google.golang.org/grpc/internal/grpcrand"
 )
 
+// 定义了在 grpc 连接失败后退避的方法
+
 // Strategy defines the methodology for backing off after a grpc connection
 // failure.
 type Strategy interface {
+	// Backoff函数，返回在给定连续失败次数的情况下，在下一次重试之前，需要等待的时间量。
+
 	// Backoff returns the amount of time to wait before the next retry given
 	// the number of consecutive failures.
 	Backoff(retries int) time.Duration

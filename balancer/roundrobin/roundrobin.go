@@ -77,6 +77,7 @@ type rrPicker struct {
 func (p *rrPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
 	p.mu.Lock()
 	sc := p.subConns[p.next]
+	// 环状自加1
 	p.next = (p.next + 1) % len(p.subConns)
 	p.mu.Unlock()
 	return balancer.PickResult{SubConn: sc}, nil

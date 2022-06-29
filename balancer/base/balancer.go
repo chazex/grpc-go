@@ -36,6 +36,9 @@ type baseBuilder struct {
 	config        Config
 }
 
+// balancer.Builder.Build()方法，在SwitchTo事件中调用的。
+// cc参数是新建的*balancerWrapper
+
 func (bb *baseBuilder) Build(cc balancer.ClientConn, opt balancer.BuildOptions) balancer.Balancer {
 	bal := &baseBalancer{
 		cc:            cc,
@@ -92,6 +95,9 @@ func (b *baseBalancer) ResolverError(err error) {
 	})
 }
 
+// UpdateClientConnState 每个balancer都需要实现这个方法，会在*ccStateUpdate事件中调用该方法。
+// 参数s包含了resolver获得的服务地址列表，以及负载均衡配置
+
 func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	// TODO: handle s.ResolverState.ServiceConfig?
 	if logger.V(2) {
@@ -101,9 +107,12 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	b.resolverErr = nil
 	// addrsSet is the set converted from addrs, it's used for quick lookup of an address.
 	addrsSet := resolver.NewAddressMap()
+	// s.ResolverState.Addresses 应该是命名解析新获取到的地址列表
 	for _, a := range s.ResolverState.Addresses {
 		addrsSet.Set(a, nil)
 		if _, ok := b.subConns.Get(a); !ok {
+			// 发现新地址，并没有在连接列表中，开始创建连接. 这里的b.cc.NewSubConn()，实际上是*balancerWrapper.NewSubConn()经过一系列周转，最终是到了grpc.ClientConn.newAddrConn()
+			// 这里并没有真正的创建连接，返回的sc是*acBalancerWrapper,他内部包含*addrConn。
 			// a is a new address (not existing in b.subConns).
 			sc, err := b.cc.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{HealthCheckEnabled: b.config.HealthCheck})
 			if err != nil {
@@ -113,9 +122,14 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 			b.subConns.Set(a, sc)
 			b.scStates[sc] = connectivity.Idle
 			b.csEvltr.RecordTransition(connectivity.Shutdown, connectivity.Idle)
+
+			// 正式创建连接（内部起一个协程，来调用到*addrConn.connect()方法）
 			sc.Connect()
 		}
 	}
+
+	// 清理过期的连接。比如：名称解析返回的地址列表中，删除了某一个地址，此时连接还在b.subConns中，此时应该把连接一处。
+
 	for _, a := range b.subConns.Keys() {
 		sci, _ := b.subConns.Get(a)
 		sc := sci.(balancer.SubConn)
@@ -137,6 +151,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	}
 
 	b.regeneratePicker()
+	// *balancerWrapper.UpdateState()
 	b.cc.UpdateState(balancer.State{ConnectivityState: b.state, Picker: b.picker})
 	return nil
 }
@@ -165,6 +180,8 @@ func (b *baseBalancer) regeneratePicker() {
 		return
 	}
 	readySCs := make(map[balancer.SubConn]SubConnInfo)
+
+	// 遍历连接池中的连接，找出状态为Ready的，交给Picker用来做负载均衡, Picker对这些可用的连接根据自身的逻辑做选择。
 
 	// Filter out all ready SCs from full subConn map.
 	for _, addr := range b.subConns.Keys() {

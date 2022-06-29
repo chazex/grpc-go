@@ -49,6 +49,8 @@ func (s State) String() string {
 }
 
 const (
+	// idle状态是初始状态，未作连接的状态
+
 	// Idle indicates the ClientConn is idle.
 	Idle State = iota
 	// Connecting indicates the ClientConn is connecting.

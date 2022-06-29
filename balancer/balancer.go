@@ -142,6 +142,8 @@ type State struct {
 // testing, the new implementation should embed this interface. This allows
 // gRPC to add new methods to this interface.
 type ClientConn interface {
+	// balancer调用此方法来创建一个SubConn，他不阻塞的去等待连接的建立。
+
 	// NewSubConn is called by balancer to create a new SubConn.
 	// It doesn't block and wait for the connections to be established.
 	// Behaviors of the SubConn can be controlled by options.

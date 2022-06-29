@@ -35,6 +35,7 @@ type Event struct {
 // Fire causes e to complete.  It is safe to call multiple times, and
 // concurrently.  It returns true iff this call to Fire caused the signaling
 // channel returned by Done to close.
+// 可以调用多次，且并发安全。 如果这次调用引发了由Done()函数返回的channel的关闭，则返回true，否则返回false.
 func (e *Event) Fire() bool {
 	ret := false
 	e.o.Do(func() {
