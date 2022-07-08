@@ -188,6 +188,8 @@ type State struct {
 	// resolver does not provide service configs.
 	ServiceConfig *serviceconfig.ParseResult
 
+	// 属性包含有关解析器的任意数据，供负载平衡策略使用。
+
 	// Attributes contains arbitrary data about the resolver intended for
 	// consumption by the load balancing policy.
 	Attributes *attributes.Attributes
