@@ -57,8 +57,10 @@ type Balancer struct {
 	// calling Close() on the current. To prevent that racing with an
 	// UpdateSubConnState from the channel, we hold currentMu during Close and
 	// UpdateSubConnState calls.
-	mu              sync.Mutex
+	mu sync.Mutex
+	// 当前使用的balancer
 	balancerCurrent *balancerWrapper
+	// 新的balancer（将要上位的balancer）
 	balancerPending *balancerWrapper
 	closed          bool // set to true when this balancer is closed
 
@@ -70,6 +72,8 @@ type Balancer struct {
 	currentMu sync.Mutex
 }
 
+// 交换balancerPending 和 balancerCurrent，并关闭balancerCurrent
+
 // swap swaps out the current lb with the pending lb and updates the ClientConn.
 // The caller must hold gsb.mu.
 func (gsb *Balancer) swap() {
@@ -80,6 +84,7 @@ func (gsb *Balancer) swap() {
 	go func() {
 		gsb.currentMu.Lock()
 		defer gsb.currentMu.Unlock()
+		// 关闭之前的balancer
 		cur.Close()
 	}()
 }
@@ -111,7 +116,7 @@ func (gsb *Balancer) SwitchTo(builder balancer.Builder) error {
 	}
 	balToClose := gsb.balancerPending // nil if there is no pending balancer
 	if gsb.balancerCurrent == nil {
-		// 如果当前balancer为nil，这将当前balancer指向新的*balancerWrapper. 这一般实在第一次初始化的时候
+		// 如果当前balancer为nil，这将当前balancer指向新的*balancerWrapper. 这一般是在第一次初始化的时候
 		gsb.balancerCurrent = bw
 	} else {
 		// 如果当前balancer不为nil，则将新的*balancerWrapper,指向pending
@@ -133,6 +138,7 @@ func (gsb *Balancer) SwitchTo(builder balancer.Builder) error {
 		if gsb.balancerPending != nil {
 			gsb.balancerPending = nil
 		} else {
+			// 进入这个分值，是因为balancerPending为nil，所以前面新建的balancerWrapper是直接给了balancerCurrennt，这一般是在第一次初始化的时候
 			gsb.balancerCurrent = nil
 		}
 		gsb.mu.Unlock()
@@ -155,6 +161,7 @@ func (gsb *Balancer) latestBalancer() *balancerWrapper {
 	if gsb.balancerPending != nil {
 		return gsb.balancerPending
 	}
+	// 走到这里，一般是第一次初始化的时候
 	return gsb.balancerCurrent
 }
 
@@ -169,7 +176,7 @@ func (gsb *Balancer) UpdateClientConnState(state balancer.ClientConnState) error
 		return errBalancerClosed
 	}
 
-	// *balancerWrapper自己没有实现UpdateClientConnState方法，这里调用的是*balancerWrapper里面包装的具体的balancer的UpdateClientConnState()方法。比如*baseBalancer
+	// *balancerWrapper自己没有实现UpdateClientConnState方法，这里调用的是*balancerWrapper里面包装的具体的balancer的UpdateClientConnState()方法，比如*baseBalancer。
 	// *balancerWrapper.Balancer的赋值是发生在SwitchTo事件中，此事件通过全局balancer.Builder表，获取到balancer.Builder，并创建balancer。
 	// Perform this call without gsb.mu to prevent deadlocks if the child calls
 	// back into the channel. The latest balancer can never be closed during a
@@ -298,6 +305,8 @@ func (bw *balancerWrapper) Close() {
 	}
 	bw.gsb.mu.Unlock()
 }
+
+// 参数state是聚合状态
 
 func (bw *balancerWrapper) UpdateState(state balancer.State) {
 	// Hold the mutex for this entire call to ensure it cannot occur

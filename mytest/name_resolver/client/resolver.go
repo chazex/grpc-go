@@ -26,6 +26,7 @@ const (
 
 type exampleResolverBuilder struct{}
 
+// Build cc 是 ccResolverWrapper
 func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
 	fmt.Println("builder start.....")
 	r := &exampleResolver{
@@ -35,6 +36,7 @@ func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientC
 			myServiceName: {backendAddr},
 		},
 	}
+	// 再Build的时候直接触发了r.ResolveNow()，也就触发了cc.UpdateState()
 	r.ResolveNow(resolver.ResolveNowOptions{})
 	return r, nil
 }
@@ -43,7 +45,8 @@ func (*exampleResolverBuilder) Scheme() string { return myScheme }
 // exampleResolver is a
 // Resolver(https://godoc.org/google.golang.org/grpc/resolver#Resolver).
 type exampleResolver struct {
-	target     resolver.Target
+	target resolver.Target
+	// cc ccResolverWrapper
 	cc         resolver.ClientConn
 	addrsStore map[string][]string
 }

@@ -96,6 +96,7 @@ type resolverErrorUpdate struct {
 }
 
 type switchToUpdate struct {
+	// name 负载均衡策略的名字
 	name string
 }
 
@@ -122,6 +123,7 @@ func (ccb *ccBalancerWrapper) watcher() {
 			}
 			switch update := u.(type) {
 			case *ccStateUpdate:
+				// 3. 调用了最新的(pending)负载均衡器的UpdateClientConnState()方法，比如baseBalancer.UpdateClientConnState()
 				ccb.handleClientConnStateChange(update.ccs)
 			case *scStateUpdate:
 				ccb.handleSubConnStateChange(update)
@@ -130,7 +132,8 @@ func (ccb *ccBalancerWrapper) watcher() {
 			case *resolverErrorUpdate:
 				ccb.handleResolverError(update.err)
 			case *switchToUpdate:
-				// 这块逻辑，仅仅是根据名字创建balancer
+				// 2.
+				// 这块逻辑，通过负载均衡名，从全局map中拿到对应的BalancerBuilder，并调用其Build()方法，生成新的Balancer,作为pending。仅仅是根据名字创建balancer
 				ccb.handleSwitchTo(update.name)
 			case *subConnUpdate:
 				ccb.handleRemoveSubConn(update.acbw)
@@ -157,6 +160,9 @@ func (ccb *ccBalancerWrapper) watcher() {
 func (ccb *ccBalancerWrapper) updateClientConnState(ccs *balancer.ClientConnState) error {
 	ccb.updateCh.Put(&ccStateUpdate{ccs: ccs})
 
+	// 等待结果: 上面发送的事件被处理完成后，会向ccb.resultCh发送一个结果(error类型)，我们再这里等待结果的完成。
+	// 所以可以认为这个调用是同步的。
+
 	var res interface{}
 	select {
 	case res = <-ccb.resultCh.Get():
@@ -181,6 +187,7 @@ func (ccb *ccBalancerWrapper) updateClientConnState(ccs *balancer.ClientConnStat
 // and the selected LB policy is not "grpclb", these addresses will be filtered
 // out and ccs will be modified with the updated address list.
 func (ccb *ccBalancerWrapper) handleClientConnStateChange(ccs *balancer.ClientConnState) {
+	// 如果负载均衡器使用的不是 grpclbName， 则把服务发现得到的地址中的resolver.GRPCLB类型的过滤掉
 	if ccb.curBalancerName != grpclbName {
 		// Filter any grpclb addresses since we don't have the grpclb balancer.
 		var addrs []resolver.Address
@@ -192,6 +199,8 @@ func (ccb *ccBalancerWrapper) handleClientConnStateChange(ccs *balancer.ClientCo
 		}
 		ccs.ResolverState.Addresses = addrs
 	}
+
+	// 发送结果
 	ccb.resultCh.Put(ccb.balancer.UpdateClientConnState(*ccs))
 }
 
@@ -354,6 +363,8 @@ func (ccb *ccBalancerWrapper) UpdateState(s balancer.State) {
 	// updated later, we could call the "connecting" picker when the state is
 	// updated, and then call the "ready" picker after the picker gets updated.
 	ccb.cc.blockingpicker.updatePicker(s.Picker)
+
+	// 更新grpc.ClientConn的状态
 	ccb.cc.csMgr.updateState(s.ConnectivityState)
 }
 

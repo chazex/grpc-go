@@ -62,19 +62,26 @@ func (bb *baseBuilder) Name() string {
 }
 
 type baseBalancer struct {
+	// cc参数是*balancerWrapper
 	cc            balancer.ClientConn
 	pickerBuilder PickerBuilder
 
 	csEvltr *balancer.ConnectivityStateEvaluator
-	state   connectivity.State
+
+	// 聚合状态
+	state connectivity.State
 
 	subConns *resolver.AddressMap
+	// baseBalancer 管理连接的地方
 	scStates map[balancer.SubConn]connectivity.State
-	picker   balancer.Picker
-	config   Config
+
+	// 用于从Ready状态的连接中，挑选出可用的连接
+	picker balancer.Picker
+	config Config
 
 	resolverErr error // the last error reported by the resolver; cleared on successful resolution
-	connErr     error // the last connection error; cleared upon leaving TransientFailure
+	// 最后一次的连接错误，在离开状态TransientFailure时，错误被清楚
+	connErr error // the last connection error; cleared upon leaving TransientFailure
 }
 
 func (b *baseBalancer) ResolverError(err error) {
@@ -111,7 +118,8 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	for _, a := range s.ResolverState.Addresses {
 		addrsSet.Set(a, nil)
 		if _, ok := b.subConns.Get(a); !ok {
-			// 发现新地址，并没有在连接列表中，开始创建连接. 这里的b.cc.NewSubConn()，实际上是*balancerWrapper.NewSubConn()经过一系列周转，最终是到了grpc.ClientConn.newAddrConn()
+			// 发现新地址: 因为地址没有在连接列表中。
+			// 开始创建连接. 这里的b.cc.NewSubConn()，实际上是*balancerWrapper.NewSubConn()经过一系列周转，最终是到了grpc.ClientConn.newAddrConn()
 			// 这里并没有真正的创建连接，返回的sc是*acBalancerWrapper,他内部包含*addrConn。
 			// a is a new address (not existing in b.subConns).
 			sc, err := b.cc.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{HealthCheckEnabled: b.config.HealthCheck})
@@ -121,6 +129,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 			}
 			b.subConns.Set(a, sc)
 			b.scStates[sc] = connectivity.Idle
+			// 这个值，固定就是Idle。
 			b.csEvltr.RecordTransition(connectivity.Shutdown, connectivity.Idle)
 
 			// 正式创建连接（内部起一个协程，来调用到*addrConn.connect()方法）
@@ -170,6 +179,11 @@ func (b *baseBalancer) mergeErrors() error {
 	return fmt.Errorf("last connection error: %v; last resolver error: %v", b.connErr, b.resolverErr)
 }
 
+// regeneratePicker 重新生成一个picker
+// picker生成策略
+//  - 如果balancer处于TransientFailure状态，则生成一个errPicker
+//  - 否则，通过pickerBuilder，针对所有Ready状态的SubConns构建一个新的picker
+
 // regeneratePicker takes a snapshot of the balancer, and generates a picker
 // from it. The picker is
 //  - errPicker if the balancer is in TransientFailure,
@@ -191,16 +205,23 @@ func (b *baseBalancer) regeneratePicker() {
 			readySCs[sc] = SubConnInfo{Address: addr}
 		}
 	}
+
+	// 根据所有可用的连接，调用pickerBuilder.Build()方法，重新生成picker
 	b.picker = b.pickerBuilder.Build(PickerBuildInfo{ReadySCs: readySCs})
 }
 
+// SubConn连接状态发生变化时，会调用此方法
+
 func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
+	// s 表示SubConn的新连接状态
 	s := state.ConnectivityState
 	if logger.V(2) {
 		logger.Infof("base.baseBalancer: handle SubConn state change: %p, %v", sc, s)
 	}
+	// oldS 表示SubConn的原始连接状态
 	oldS, ok := b.scStates[sc]
 	if !ok {
+		// 连接不存在
 		if logger.V(2) {
 			logger.Infof("base.baseBalancer: got state changes for an unknown SubConn: %p, %v", sc, s)
 		}
@@ -216,11 +237,14 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 		}
 		return
 	}
+	// 更新subConn状态
 	b.scStates[sc] = s
 	switch s {
 	case connectivity.Idle:
+		// 状态还是Idle，再次连接
 		sc.Connect()
 	case connectivity.Shutdown:
+		// 当一个地址被resolver移除，此时会调用removeSubConn，但是scStates中关于这个连接的状态还在保持。 我们在这里移除这个subConn的状态。
 		// When an address was removed by resolver, b called RemoveSubConn but
 		// kept the sc's state in scStates. Remove state for this sc here.
 		delete(b.scStates, sc)
@@ -231,16 +255,24 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 
 	b.state = b.csEvltr.RecordTransition(oldS, s)
 
+	// s == （connectivity.Ready) != (oldS == connectivity.Ready) ：这段代码解释： 新状态和老状态，只有一个是Ready在为True，都是Ready，或都不是Ready时，为false
+
 	// Regenerate picker when one of the following happens:
 	//  - this sc entered or left ready
 	//  - the aggregated state of balancer is TransientFailure
 	//    (may need to update error message)
 	if (s == connectivity.Ready) != (oldS == connectivity.Ready) ||
 		b.state == connectivity.TransientFailure {
+		//   新老状态只有一个为Ready (这以为着连接状态发生了变化，从Ready变成非Ready，或者从非Ready变成了Ready，这两种情况都要更新Picker)
+		// 或者
+		//   聚合状态为TransientFailure 时，重新生成Picker
 		b.regeneratePicker()
 	}
 	b.cc.UpdateState(balancer.State{ConnectivityState: b.state, Picker: b.picker})
 }
+
+// 关闭balancer：发生在CurrentBalancer和PendingBalancer交换时，将CurrentBalancer关闭。
+// 不过对于baseBalancer不需要关闭，所以关闭是个空函数，因为它没有需要清理的内部状态；它也不需要调用为SubConns调用RemoveSubConn
 
 // Close is a nop because base balancer doesn't have internal state to clean up,
 // and it doesn't need to call RemoveSubConn for the SubConns.

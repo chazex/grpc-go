@@ -30,6 +30,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// pickerWrapper 是对balancer.Picker的封装。它在某一个具体的pick动作上阻塞，但是在picker更新上不阻塞。
+
 // pickerWrapper is a wrapper of balancer.Picker. It blocks on certain pick
 // actions and unblock when there's a picker update.
 type pickerWrapper struct {
@@ -74,6 +76,8 @@ func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) f
 	}
 }
 
+// 在client调用rpc，做负载均衡时，就是从这里做pick动作，选择连接的。
+
 // pick returns the transport that will be used for the RPC.
 // It may block in the following cases:
 // - there's no picker
@@ -115,14 +119,18 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 					return nil, nil, status.Error(codes.Canceled, errStr)
 				}
 			case <-ch:
+				// 如果没有picker，则在这里阻塞(这个应该是出现在初始化的时候)。
+				// 在更新picker的时候，会关闭这个channel，所以这里会从阻塞退出来
 			}
 			continue
 		}
 
+		// 这里赋值一下：目的是如果获取http2连接失败了，循环会再次判断ch == pw.blockingCh，如果更新了picker，则二者不相等，再次pick就可以；如果相等说明没更新picker，只能继续等待picker的更新，然后再pick
 		ch = pw.blockingCh
 		p := pw.picker
 		pw.mu.Unlock()
 
+		// 拿到SubConn
 		pickResult, err := p.Pick(info)
 
 		if err != nil {
@@ -151,6 +159,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 			if channelz.IsOn() {
 				return t, doneChannelzWrapper(acw, pickResult.Done), nil
 			}
+			// 成功拿到http2连接，函数返回
 			return t, pickResult.Done, nil
 		}
 		if pickResult.Done != nil {

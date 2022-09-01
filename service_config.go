@@ -59,6 +59,8 @@ type lbConfig struct {
 type ServiceConfig struct {
 	serviceconfig.Config
 
+	// LB dial时，用户配置的负载均衡策略的名称
+
 	// LB is the load balancer the service providers recommends. The balancer
 	// specified via grpc.WithBalancerName will override this.  This is deprecated;
 	// lbConfigs is preferred.  If lbConfig and LB are both present, lbConfig
@@ -96,6 +98,9 @@ type ServiceConfig struct {
 	// healthCheckConfig must be set as one of the requirement to enable LB channel
 	// health check.
 	healthCheckConfig *healthCheckConfig
+
+	// rawJSONString dial时，用户通过grpc.WithDefaultServiceConfig()配置的负载均衡策略等的配置的原始json字符串
+
 	// rawJSONString stores service config json string that get parsed into
 	// this service config struct.
 	rawJSONString string
@@ -212,6 +217,7 @@ type jsonMC struct {
 
 // TODO(lyuxuan): delete this struct after cleaning up old service config implementation.
 type jsonSC struct {
+	// LoadBalancingPolicy dial时，用户通过grpc.WithDefaultServiceConfig()配置的负载均衡策略的名称
 	LoadBalancingPolicy *string
 	LoadBalancingConfig *internalserviceconfig.BalancerConfig
 	MethodConfig        *[]jsonMC
@@ -233,6 +239,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 		return &serviceconfig.ParseResult{Err: err}
 	}
 	sc := ServiceConfig{
+		// LB dial时，用户配置的负载均衡策略的名称
 		LB:                rsc.LoadBalancingPolicy,
 		Methods:           make(map[string]MethodConfig),
 		retryThrottling:   rsc.RetryThrottling,
@@ -240,6 +247,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 		rawJSONString:     js,
 	}
 	if c := rsc.LoadBalancingConfig; c != nil {
+		// 也是一个负载均衡策略的配置，如果lbConfig 合 LB 同时存在，lbConfig优先级更高
 		sc.lbConfig = &lbConfig{
 			name: c.Name,
 			cfg:  c.Config,
@@ -269,6 +277,8 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 			logger.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
 			return &serviceconfig.ParseResult{Err: err}
 		}
+
+		// 最大请求消息字节数
 		if m.MaxRequestMessageBytes != nil {
 			if *m.MaxRequestMessageBytes > int64(maxInt) {
 				mc.MaxReqSize = newInt(maxInt)
@@ -276,6 +286,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 				mc.MaxReqSize = newInt(int(*m.MaxRequestMessageBytes))
 			}
 		}
+		//最大响应消息字节数
 		if m.MaxResponseMessageBytes != nil {
 			if *m.MaxResponseMessageBytes > int64(maxInt) {
 				mc.MaxRespSize = newInt(maxInt)

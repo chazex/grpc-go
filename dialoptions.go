@@ -56,21 +56,24 @@ type dialOptions struct {
 	cp Compressor
 	dc Decompressor
 	// 连接失败的回退策略
-	bs                          internalbackoff.Strategy
-	block                       bool
-	returnLastError             bool
-	timeout                     time.Duration
-	scChan                      <-chan ServiceConfig
-	authority                   string
-	copts                       transport.ConnectOptions
-	callOptions                 []CallOption
-	channelzParentID            *channelz.Identifier
-	disableServiceConfig        bool
-	disableRetry                bool
-	disableHealthCheck          bool
-	healthCheckFunc             internal.HealthChecker
-	minConnectTimeout           func() time.Duration
-	defaultServiceConfig        *ServiceConfig // defaultServiceConfig is parsed from defaultServiceConfigRawJSON.
+	bs              internalbackoff.Strategy
+	block           bool
+	returnLastError bool
+	timeout         time.Duration
+	// scChan 已经过期了，因为WithServiceConfig()方法过期了
+	scChan               <-chan ServiceConfig
+	authority            string
+	copts                transport.ConnectOptions
+	callOptions          []CallOption
+	channelzParentID     *channelz.Identifier
+	disableServiceConfig bool
+	disableRetry         bool
+	disableHealthCheck   bool
+	healthCheckFunc      internal.HealthChecker
+	minConnectTimeout    func() time.Duration
+	// 通过解析defaultServiceConfigRawJSON,得到的 ServiceConfig
+	defaultServiceConfig *ServiceConfig // defaultServiceConfig is parsed from defaultServiceConfigRawJSON.
+	// Dial时传过来的负载均衡等的配置，它是一个json字符串
 	defaultServiceConfigRawJSON *string
 	resolvers                   []resolver.Builder
 }

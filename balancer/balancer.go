@@ -159,6 +159,9 @@ type ClientConn interface {
 	// This will trigger a state transition for the SubConn.
 	UpdateAddresses(SubConn, []resolver.Address)
 
+	// UpdateState 通知gRPC，balancer的内部状态已经改变。
+	// gRPC将会更新balancer.ClientConn的连接状态, 并且将会调用新的Picker的Pick()方法去选择新的子连接
+
 	// UpdateState notifies gRPC that the balancer's internal state has
 	// changed.
 	//
@@ -208,6 +211,7 @@ type BuildOptions struct {
 
 // Builder creates a balancer.
 type Builder interface {
+	// Build 这里的 cc 是 balancerWrapper
 	// Build creates a new balancer with the ClientConn.
 	Build(cc ClientConn, opts BuildOptions) Balancer
 	// Name returns the name of balancers built by this builder.
@@ -354,8 +358,10 @@ type ExitIdler interface {
 
 // SubConnState describes the state of a SubConn.
 type SubConnState struct {
+	// ConnectivityState 用于表示SubConn的连接状态
 	// ConnectivityState is the connectivity state of the SubConn.
 	ConnectivityState connectivity.State
+	// 如果ConnectivityState 处于 TransientFailure 状态，则ConnectionError会被设置值，其值用来描述SubConn失败的原因，否则 ConnectionError为nil
 	// ConnectionError is set if the ConnectivityState is TransientFailure,
 	// describing the reason the SubConn failed.  Otherwise, it is nil.
 	ConnectionError error
@@ -364,6 +370,7 @@ type SubConnState struct {
 // ClientConnState describes the state of a ClientConn relevant to the
 // balancer.
 type ClientConnState struct {
+	// ResolverState 是Resolver在服务地址变更时触发的服务信息
 	ResolverState resolver.State
 	// The parsed load balancing configuration returned by the builder's
 	// ParseConfig method, if implemented.
@@ -384,6 +391,14 @@ type ConnectivityStateEvaluator struct {
 	numTransientFailure uint64 // Number of addrConns in transient failure state.
 	numIdle             uint64 // Number of addrConns in idle state.
 }
+
+// RecordTransition 记录SubConn的状态变更，并且基于此评估聚合状态应该是什么
+// - 如果至少一个SubConn是Ready，聚合状态是Ready (感觉和代码逻辑不太一样，至少有一个是Ready则Ready，如果两个都是Ready，那么应该就是Ready。但是代码两个都是Ready的话，-1 和 1相抵，和为0，返回connectivity.TransientFailure)
+// - Else if 至少一个SubConn是Connecting，聚合状态是Connecting (由于是Else if，所以前提是没有SubConn是Ready)
+// - Else if 至少一个SubConn状态是TransientFailure，聚合状态是Transient Failure
+// - Else if 至少一个SubConn是Idle，聚合状态是Idle
+// - Else 没有SubConn，聚合状态是Transient Failure
+// Shutdown不被考虑在内
 
 // RecordTransition records state change happening in subConn and based on that
 // it evaluates what aggregated state should be.

@@ -202,6 +202,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	}
 
 	if cc.dopts.defaultServiceConfigRawJSON != nil {
+		// 解析用户的配置（包括负载均衡策略)
 		scpr := parseServiceConfig(*cc.dopts.defaultServiceConfigRawJSON)
 		if scpr.Err != nil {
 			return nil, fmt.Errorf("%s: %v", invalidDefaultServiceConfigErrPrefix, scpr.Err)
@@ -302,7 +303,8 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 
 	// 构建名称解析
 	// 1. 通过ResolverBuilder构建出Resolver
-	// tips: ResolverBuilder是通过全局注册进来的,调用起Build方法. Build方法会生成Resolver实例，并发送通过调用ccResolverWrapper.UpdateState()方法来switchToUpdate事件
+	// tips: ResolverBuilder是通过全局注册进来的,调用它的Build()方法会生成Resolver实例。当服务实例列表发生变更时，Resolver实例会通过调用ccResolverWrapper.UpdateState()方法来发送switchToUpdate事件，
+	// 从而通知到grpc，服务地址列表发生变化。 从这里我们也可以看出，在Resolver实例和grpc服务发现之间架起的桥梁就是*ccResolverWrapper
 	// Build the resolver.
 	rWrapper, err := newCCResolverWrapper(cc, resolverBuilder)
 	if err != nil {
@@ -614,11 +616,14 @@ func init() {
 // 函数名的意思是“可能”使用默认的ServiceConfig
 
 func (cc *ClientConn) maybeApplyDefaultServiceConfig(addrs []resolver.Address) {
+	// 首次的时候，cc.sc肯定是nil。 因为给cc.sc赋值的channel，已经被废弃了.
+	// 后面进来的时候，由于在函数applyServiceConfigAndBalancer中对cc.sc赋值了，所以他就不是空了。
 	if cc.sc != nil {
-		// 这里的cc.sc是 从resolver得到的最新的ServiceConfig，优先使用这个。
+		//
 		cc.applyServiceConfigAndBalancer(cc.sc, nil, addrs)
 		return
 	}
+	// 优先使用用户配置，如果没有用户配置，则使用emptyServiceConfig。
 	if cc.dopts.defaultServiceConfig != nil {
 		// 其次使用默认的服务配置，这个是通过解析   grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`) 得到的。
 		cc.applyServiceConfigAndBalancer(cc.dopts.defaultServiceConfig, &defaultConfigSelector{cc.dopts.defaultServiceConfig}, addrs)
@@ -976,6 +981,10 @@ func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method st
 	})
 }
 
+// sc 的几种情况
+// 1. Resolver变更时，携带了ServiceConfig
+// 2. 用户通过grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"weighted_round_robin"}`)配置的ServiceConfig
+// 3. 前两者都没有，则是emptyServiceConfig（只要某一次变更携带了ServiceConfig，那么会保留这个ServiceConfig到cc.sc中）
 func (cc *ClientConn) applyServiceConfigAndBalancer(sc *ServiceConfig, configSelector iresolver.ConfigSelector, addrs []resolver.Address) {
 	if sc == nil {
 		// should never reach here.
@@ -1017,10 +1026,10 @@ func (cc *ClientConn) applyServiceConfigAndBalancer(sc *ServiceConfig, configSel
 		if isGRPCLB {
 			newBalancerName = grpclbName
 		} else if cc.sc != nil && cc.sc.LB != nil {
-			// 2. 其实使用LB
+			// 2. 其次使用LB
 			newBalancerName = *cc.sc.LB
 		} else {
-			// 3. 默认使用pick_first
+			// 3. 默认使用pick_first(没有配置负载均衡时)
 			newBalancerName = PickFirstBalancerName
 		}
 	}
@@ -1491,6 +1500,7 @@ func (ac *addrConn) getReadyTransport() transport.ClientTransport {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 	if ac.state == connectivity.Ready {
+		// 返回http2
 		return ac.transport
 	}
 	return nil
