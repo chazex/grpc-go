@@ -102,6 +102,7 @@ const (
 
 // Dial creates a client connection to the given target.
 func Dial(target string, opts ...DialOption) (*ClientConn, error) {
+	fmt.Println("======================= Start Dial ==================================")
 	return DialContext(context.Background(), target, opts...)
 }
 
@@ -133,6 +134,7 @@ func (dcs *defaultConfigSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*ires
 // https://github.com/grpc/grpc/blob/master/doc/naming.md.
 // e.g. to use dns resolver, a "dns:///" prefix should be applied to the target.
 func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *ClientConn, err error) {
+	fmt.Println("======================开始创建连接========================")
 	cc := &ClientConn{
 		//连接字符串
 		target: target,
@@ -314,22 +316,28 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	cc.resolverWrapper = rWrapper
 	cc.mu.Unlock()
 
+	// 如果用户配置了 WithBlock option，则会轮询ClientConn状态，
+
 	// A blocking dial blocks until the clientConn is ready.
 	if cc.dopts.block {
 		for {
 			// 执行连接
 			cc.Connect()
+			// 获取状态
 			s := cc.GetState()
 			if s == connectivity.Ready {
 				break
 			} else if cc.dopts.copts.FailOnNonTempDialError && s == connectivity.TransientFailure {
+				// 如果连接状态是TransientFailure， 并且用户配置了FailOnNonTempDialError（非临时性错误）时触发失败，则判断错误是否为临时性错误
 				if err = cc.connectionError(); err != nil {
 					terr, ok := err.(interface {
 						Temporary() bool
 					})
 					if ok && !terr.Temporary() {
+						// 不是临时性错误
 						return nil, err
 					}
+					// 临时性错误：继续轮询
 				}
 			}
 			if !cc.WaitForStateChange(ctx, s) {
@@ -519,9 +527,13 @@ type ClientConn struct {
 	mkp   keepalive.ClientParameters // May be updated upon receipt of a GoAway.
 
 	lceMu sync.Mutex // protects lastConnectionError
-	// 在创建连接过程中，记录最后一个连接错误。这个error!=nil，不代表连接失败，因为创建连接是通过一个地址列表来创建的，没失败一次就会更新以下这个变量，遇到一个成功，就算成功。
+	// 在创建连接过程中，记录最后一个连接错误。这个error!=nil，不代表连接失败，因为创建连接是通过一个地址列表来创建的，每失败一次就会更新一下这个变量，遇到一个成功，就算成功。
 	lastConnectionError error
 }
+
+// WaitForStateChange 等待ClientConn连接状态的改变，或者 ctx过期
+// 在前一种情况返回真值(状态改变)
+// 在后一种情况返回假值(ctx过期)
 
 // WaitForStateChange waits until the connectivity.State of ClientConn changes from sourceState or
 // ctx expires. A true value is returned in former case and false in latter.
@@ -619,7 +631,6 @@ func (cc *ClientConn) maybeApplyDefaultServiceConfig(addrs []resolver.Address) {
 	// 首次的时候，cc.sc肯定是nil。 因为给cc.sc赋值的channel，已经被废弃了.
 	// 后面进来的时候，由于在函数applyServiceConfigAndBalancer中对cc.sc赋值了，所以他就不是空了。
 	if cc.sc != nil {
-		//
 		cc.applyServiceConfigAndBalancer(cc.sc, nil, addrs)
 		return
 	}
@@ -836,9 +847,12 @@ func (ac *addrConn) connect() error {
 		return errConnClosing
 	}
 	if ac.state != connectivity.Idle {
+		// 不是Idle状态，则返回，如果是Idle状态，才继续建立连接
 		ac.mu.Unlock()
 		return nil
 	}
+
+	// 更新连接状态为 Connecting
 	// 在锁内更新连接状态，以防止后续或并发调用多次重置传输。
 
 	// Update connectivity state within the lock to prevent subsequent or
@@ -974,6 +988,7 @@ func (cc *ClientConn) healthCheckConfig() *healthCheckConfig {
 	return cc.sc.healthCheckConfig
 }
 
+// 通过picker，实现负载均衡策略拿到连接
 func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, func(balancer.DoneInfo), error) {
 	return cc.blockingpicker.pick(ctx, failfast, balancer.PickInfo{
 		Ctx:            ctx,
@@ -1210,7 +1225,7 @@ func (ac *addrConn) resetTransport() {
 	// https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md#proposed-backoff-algorithm
 	connectDeadline := time.Now().Add(dialDuration)
 
-	// 更新子连接状态变更时间， *scStateUpdate
+	// 更新子连接状态变更事件， *scStateUpdate
 	ac.updateConnectivityState(connectivity.Connecting, nil)
 	ac.mu.Unlock()
 
@@ -1429,6 +1444,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 func (ac *addrConn) startHealthCheck(ctx context.Context) {
 	var healthcheckManagingState bool
 	defer func() {
+		// 如果没有配置针对某个连接的健康检测，那么直接设置连接的状态为Ready
 		if !healthcheckManagingState {
 			ac.updateConnectivityState(connectivity.Ready, nil)
 		}
@@ -1453,6 +1469,7 @@ func (ac *addrConn) startHealthCheck(ctx context.Context) {
 		return
 	}
 
+	// 走到这里，说明配置了某个连接的健康检测，那么暂时不发送连接状态，在健康检测函数中设置连接状态
 	healthcheckManagingState = true
 
 	// Set up the health check helper functions.
@@ -1667,6 +1684,7 @@ func (cc *ClientConn) parseTargetAndFindResolver() (resolver.Builder, error) {
 	var rb resolver.Builder
 	// 解析URL
 	parsedTarget, err := parseTarget(cc.target)
+	fmt.Println("获取到的scheme--", parsedTarget.Scheme)
 	if err != nil {
 		channelz.Infof(logger, cc.channelzID, "dial target %q parse failed: %v", cc.target, err)
 	} else {

@@ -62,7 +62,7 @@ func (bb *baseBuilder) Name() string {
 }
 
 type baseBalancer struct {
-	// cc参数是*balancerWrapper
+	// cc参数是*balancerWrapper，*balancerWrapper是对当前baseBalancer的包装
 	cc            balancer.ClientConn
 	pickerBuilder PickerBuilder
 
@@ -102,10 +102,13 @@ func (b *baseBalancer) ResolverError(err error) {
 	})
 }
 
-// UpdateClientConnState 每个balancer都需要实现这个方法，会在*ccStateUpdate事件中调用该方法。
+// UpdateClientConnState 每个balancer都需要实现这个方法，当resolver发现服务地址有变化时，会通过发送*ccStateUpdate事件，来调用该方法。
 // 参数s包含了resolver获得的服务地址列表，以及负载均衡配置
 
 func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
+	d, _ := s.ResolverState.Attributes.Value("state_attr").(string)
+	fmt.Printf("触发更新\t%p\t%d\t%v\n", b, b.subConns.Len(), d)
+
 	// TODO: handle s.ResolverState.ServiceConfig?
 	if logger.V(2) {
 		logger.Info("base.baseBalancer: got new ClientConn state: ", s)
@@ -117,6 +120,12 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	// s.ResolverState.Addresses 应该是命名解析新获取到的地址列表
 	for _, a := range s.ResolverState.Addresses {
 		addrsSet.Set(a, nil)
+		// 这里需要注意一点：代码在这里执行的时候，其实是一个新的Balancer，里面的连接(b.subConns)是空的。
+		// 因为每次域名解析得到新的地址列表的时候，都会调用BalancerBuilder.Build()重新创建一个Balancer，所以它的subConns是空的，但是这里面还是get了一下看有没有，我感觉这里是怕重复
+		// 所以每此新生成的Balancer，其内部的连接都是新建的。
+
+		// 上面的结论是错误的。 在每次域名解析得到新的地址列表的时候，在balancer_name没有发生变化的时候，是不会调用BalancerBuilder.Build()的。
+		// 也就是说，只有负载均衡策略发生了改变，才会调用BalancerBuilder.Build()，重新生成Balancer。
 		if _, ok := b.subConns.Get(a); !ok {
 			// 发现新地址: 因为地址没有在连接列表中。
 			// 开始创建连接. 这里的b.cc.NewSubConn()，实际上是*balancerWrapper.NewSubConn()经过一系列周转，最终是到了grpc.ClientConn.newAddrConn()
@@ -127,6 +136,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 				logger.Warningf("base.baseBalancer: failed to create new SubConn: %v", err)
 				continue
 			}
+			fmt.Println("balancer发现新的地址\t创建新连接", a.Addr, a.Attributes)
 			b.subConns.Set(a, sc)
 			b.scStates[sc] = connectivity.Idle
 			// 这个值，固定就是Idle。
@@ -189,6 +199,7 @@ func (b *baseBalancer) mergeErrors() error {
 //  - errPicker if the balancer is in TransientFailure,
 //  - built by the pickerBuilder with all READY SubConns otherwise.
 func (b *baseBalancer) regeneratePicker() {
+	fmt.Println("执行了 regeneratePicker")
 	if b.state == connectivity.TransientFailure {
 		b.picker = NewErrPicker(b.mergeErrors())
 		return
@@ -211,6 +222,7 @@ func (b *baseBalancer) regeneratePicker() {
 }
 
 // SubConn连接状态发生变化时，会调用此方法
+// 比如Resolver发现新的地址，此时负载均衡会依据新的服务地址创建新的连接，创建连接之前，把连接状态设置为Connecting
 
 func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
 	// s 表示SubConn的新连接状态
@@ -254,6 +266,7 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 	}
 
 	b.state = b.csEvltr.RecordTransition(oldS, s)
+	fmt.Printf("聚合状态\t老状态： %v\t新状态：%v\t聚合状态\t%v\n", oldS, s, b.state)
 
 	// s == （connectivity.Ready) != (oldS == connectivity.Ready) ：这段代码解释： 新状态和老状态，只有一个是Ready在为True，都是Ready，或都不是Ready时，为false
 
@@ -263,7 +276,7 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 	//    (may need to update error message)
 	if (s == connectivity.Ready) != (oldS == connectivity.Ready) ||
 		b.state == connectivity.TransientFailure {
-		//   新老状态只有一个为Ready (这以为着连接状态发生了变化，从Ready变成非Ready，或者从非Ready变成了Ready，这两种情况都要更新Picker)
+		//   新老状态只有一个为Ready (这意味着连接状态发生了变化，从Ready变成非Ready，或者从非Ready变成了Ready，这两种情况都要更新Picker)
 		// 或者
 		//   聚合状态为TransientFailure 时，重新生成Picker
 		b.regeneratePicker()

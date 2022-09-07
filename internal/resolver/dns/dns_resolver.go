@@ -124,9 +124,14 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	// IP address.
 	if ipAddr, ok := formatIP(host); ok {
 		addr := []resolver.Address{{Addr: ipAddr + ":" + port}}
+		// 是合法的IP地址，不走后续的dns解析逻辑了，直接通知更新
 		cc.UpdateState(resolver.State{Addresses: addr})
 		return deadResolver{}, nil
 	}
+
+	// 如果不是IP地址格式（域名），此时使用域名解析
+
+	// 根据 Authority 判定使用默认Resolver还是自定义Resolver
 
 	// DNS address (non-IP).
 	ctx, cancel := context.WithCancel(context.Background())
@@ -150,6 +155,7 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	}
 
 	d.wg.Add(1)
+	// 监听域名解析到ip的变化，监听到变化后，做通知
 	go d.watcher()
 	return d, nil
 }
@@ -351,6 +357,10 @@ func (d *dnsResolver) lookup() (*resolver.State, error) {
 	}
 	return &state, nil
 }
+
+// formatIP 判断addr是不是一个IP. 如果addr不是 IP 地址的有效文本表示，返回ok=false
+// 如果addr是IPv4，返回地址，ok=true
+// 如果addr是IPv6，使用方括号包围的地址， ok=true
 
 // formatIP returns ok = false if addr is not a valid textual representation of an IP address.
 // If addr is an IPv4 address, return the addr and ok = true.

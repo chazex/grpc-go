@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/resolver"
+	"log"
 )
 
 // Following is an example name resolver. It includes a
@@ -28,7 +30,7 @@ type exampleResolverBuilder struct{}
 
 // Build cc 是 ccResolverWrapper
 func (*exampleResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
-	fmt.Println("builder start.....")
+	fmt.Println("builder start.....", target.URL.String())
 	r := &exampleResolver{
 		target: target,
 		cc:     cc,
@@ -56,8 +58,8 @@ func (r *exampleResolver) ResolveNow(o resolver.ResolveNowOptions) {
 	addrStrs := r.addrsStore[r.target.Endpoint]
 	addrs := make([]resolver.Address, len(addrStrs))
 	for i, s := range addrStrs {
-		fmt.Println("addr: ", s)
-		addrs[i] = resolver.Address{Addr: s}
+		log.Println("addr item: ", s)
+		addrs[i] = resolver.Address{Addr: s, BalancerAttributes: attributes.New("a", "b").WithValue("c", "d")}
 	}
 	r.cc.UpdateState(resolver.State{Addresses: addrs}) // 这里可以对State中添加balancer
 }
@@ -67,6 +69,6 @@ func (*exampleResolver) Close() {}
 func init() {
 	// Register the example ResolverBuilder. This is usually done in a package's
 	// init() function.
-	fmt.Println("init resolver builder")
+	log.Println("register common resolver builder")
 	resolver.Register(&exampleResolverBuilder{})
 }

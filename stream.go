@@ -427,6 +427,7 @@ func (a *csAttempt) getTransport() error {
 	cs := a.cs
 
 	var err error
+	// 通过负载均衡拿到连接
 	a.t, a.done, err = cs.cc.getTransport(a.ctx, cs.callInfo.failFast, cs.callHdr.Method)
 	if err != nil {
 		if de, ok := err.(dropError); ok {

@@ -36,9 +36,10 @@ import (
 type ccResolverWrapper struct {
 	cc         *ClientConn
 	resolverMu sync.Mutex
-	resolver   resolver.Resolver
-	done       *grpcsync.Event
-	curState   resolver.State
+	// 通过ResolverBuilder.Build()得到的Resolver
+	resolver resolver.Resolver
+	done     *grpcsync.Event
+	curState resolver.State
 
 	incomingMu sync.Mutex // Synchronizes all the incoming calls.
 }

@@ -169,6 +169,8 @@ type ClientConn interface {
 	// Pick on the new Picker to pick new SubConns.
 	UpdateState(State)
 
+	// ResolveNow balancer调用它，用来通知gRPC去做一个名称解析
+
 	// ResolveNow is called by balancer to notify gRPC to do a name resolving.
 	ResolveNow(resolver.ResolveNowOptions)
 
@@ -411,6 +413,7 @@ type ConnectivityStateEvaluator struct {
 //
 // Shutdown is not considered.
 func (cse *ConnectivityStateEvaluator) RecordTransition(oldState, newState connectivity.State) connectivity.State {
+	// cse.numReady cse.numConnecting cse.numTransientFailure cse.numIdle 是服务发现到的多个连接累加的，这一点开始没注意到。 卡了很久
 	// Update counters.
 	for idx, state := range []connectivity.State{oldState, newState} {
 		updateVal := 2*uint64(idx) - 1 // -1 for oldState and +1 for new.

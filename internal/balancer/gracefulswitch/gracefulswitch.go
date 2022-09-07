@@ -41,6 +41,8 @@ func NewBalancer(cc balancer.ClientConn, opts balancer.BuildOptions) *Balancer {
 	}
 }
 
+// gracefulswitch.Balancer是一个用来优雅切换balancer的工具。它实现了balancer.Balancer接口。
+
 // Balancer is a utility to gracefully switch from one balancer to
 // a new balancer. It implements the balancer.Balancer interface.
 type Balancer struct {
@@ -77,7 +79,9 @@ type Balancer struct {
 // swap swaps out the current lb with the pending lb and updates the ClientConn.
 // The caller must hold gsb.mu.
 func (gsb *Balancer) swap() {
+	// 更新picker
 	gsb.cc.UpdateState(gsb.balancerPending.lastState)
+	// 交换
 	cur := gsb.balancerCurrent
 	gsb.balancerCurrent = gsb.balancerPending
 	gsb.balancerPending = nil
@@ -124,6 +128,7 @@ func (gsb *Balancer) SwitchTo(builder balancer.Builder) error {
 		gsb.balancerPending = bw
 	}
 	gsb.mu.Unlock()
+	// 将老的pending状态的balancer关闭掉
 	balToClose.Close()
 
 	//调用balancer.Builder.Build()方法，构建balancer
@@ -320,7 +325,11 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 		return
 	}
 
+	// 因为balancer中的每一个子链接状态变更，或者resolver发现了新的连接并且负载均衡策略不改变，会都进入到baseBalancer.UpdateSubConnState()中，也就会调用当前发方法，此时bw == bw.gsb.balancerCurrent
 	if bw == bw.gsb.balancerCurrent {
+		// 如果当前current balancer退出READY状态，并且存在一个pending banlancer,
+		// 不太理解：这里只能证明只有一个子链接出现了问题,而不判断pending balancer的状态，直接切换，合适吗？
+
 		// In the case that the current balancer exits READY, and there is a pending
 		// balancer, you can forward the pending balancer's cached State up to
 		// ClientConn and swap the pending into the current. This is because there
@@ -330,6 +339,9 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 			bw.gsb.swap()
 			return
 		}
+
+		// 走到这里的情况是：balancer建立了一个新的READY的连接(因为连接建立是异步的)，所以要更新picker.
+
 		// Even if there is a pending balancer waiting to be gracefully switched to,
 		// continue to forward current balancer updates to the Client Conn. Ignoring
 		// state + picker from the current would cause undefined behavior/cause the
@@ -339,6 +351,10 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 		bw.gsb.cc.UpdateState(state)
 		return
 	}
+
+	// 代码走到这里，说明当前的balancer处于pending状态（因为它不等于currentBalancer）
+	// 此时如果current的状态不是Ready，而当前balancer状态不是Connecting，那么我们做交换，将当前balancer，设置为current
+
 	// This method is now dealing with a state update from the pending balancer.
 	// If the current balancer is currently in a state other than READY, the new
 	// policy can be swapped into place immediately. This is because there is no
@@ -381,6 +397,7 @@ func (bw *balancerWrapper) ResolveNow(opts resolver.ResolveNowOptions) {
 	if bw != bw.gsb.latestBalancer() {
 		return
 	}
+	// 通知grpc去做一次域名解析
 	bw.gsb.cc.ResolveNow(opts)
 }
 

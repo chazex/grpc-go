@@ -32,6 +32,8 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
+// ccBalancerWrapper 是grpc.ClientConn 和 Balancer之间的桥梁
+
 // ccBalancerWrapper sits between the ClientConn and the Balancer.
 //
 // ccBalancerWrapper implements methods corresponding to the ones on the
@@ -123,19 +125,26 @@ func (ccb *ccBalancerWrapper) watcher() {
 			}
 			switch update := u.(type) {
 			case *ccStateUpdate:
+				fmt.Println("收到ccStateUpdate事件")
 				// 3. 调用了最新的(pending)负载均衡器的UpdateClientConnState()方法，比如baseBalancer.UpdateClientConnState()
 				ccb.handleClientConnStateChange(update.ccs)
 			case *scStateUpdate:
+				// 4. 某个连接状态变化事件
+				// 触发场景：1.服务列表变化，发现有新的地址，此时需要创建连接，创建连接之前将连接状态置为Connecting
+				//         2. 连接创建成功后，会设置连接状态为Ready
 				ccb.handleSubConnStateChange(update)
 			case *exitIdleUpdate:
 				ccb.handleExitIdle()
 			case *resolverErrorUpdate:
 				ccb.handleResolverError(update.err)
 			case *switchToUpdate:
-				// 2.
+				fmt.Println("收到switchToUpdate事件")
+				// 2. 在Resolver触发服务地址变更后，会发送这个事件。
 				// 这块逻辑，通过负载均衡名，从全局map中拿到对应的BalancerBuilder，并调用其Build()方法，生成新的Balancer,作为pending。仅仅是根据名字创建balancer
 				ccb.handleSwitchTo(update.name)
 			case *subConnUpdate:
+				// 清除连接
+				// 触发场景：1. 在新的一次Resolver服务发现的过程中，某个地址已经被删除。此时需要移除对应的连接
 				ccb.handleRemoveSubConn(update.acbw)
 			default:
 				logger.Errorf("ccBalancerWrapper.watcher: unknown update %+v, type %T", update, update)
@@ -268,11 +277,17 @@ func (ccb *ccBalancerWrapper) switchTo(name string) {
 // balancer.Builder corresponding to name. If no balancer.Builder is registered
 // for the given name, it uses the default LB policy which is "pick_first".
 func (ccb *ccBalancerWrapper) handleSwitchTo(name string) {
+	// 这里的处理逻辑，一直被我忽略了。
+	// 当负载均衡的名字，没有发生变化时，不会重新生成负载均衡器.
+
 	// TODO: Other languages use case-insensitive balancer registries. We should
 	// switch as well. See: https://github.com/grpc/grpc-go/issues/5288.
 	if strings.EqualFold(ccb.curBalancerName, name) {
+		fmt.Println("负载均衡没变化")
 		return
 	}
+
+	fmt.Printf("初始化负载均衡器[%s]............\n", name)
 
 	// 通过名字，从全局balancer表中获取balancer.Builder
 	// TODO: Ensure that name is a registered LB policy when we get here.
