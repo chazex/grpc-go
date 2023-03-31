@@ -442,6 +442,7 @@ func (a *csAttempt) getTransport() error {
 	return nil
 }
 
+// 创建grpc流
 func (a *csAttempt) newStream() error {
 	cs := a.cs
 	cs.callHdr.PreviousAttempts = cs.numRetries
@@ -693,6 +694,8 @@ func (cs *clientStream) Context() context.Context {
 	}
 	return cs.ctx
 }
+
+// 执行op()方法，失败时有重试，成功时执行onSuccess
 
 func (cs *clientStream) withRetry(op func(a *csAttempt) error, onSuccess func()) error {
 	cs.mu.Lock()

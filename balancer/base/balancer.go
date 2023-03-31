@@ -139,7 +139,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 			fmt.Println("balancer发现新的地址\t创建新连接", a.Addr, a.Attributes)
 			b.subConns.Set(a, sc)
 			b.scStates[sc] = connectivity.Idle
-			// 这个值，固定就是Idle。
+			// 这里是为idle状态的数量+1
 			b.csEvltr.RecordTransition(connectivity.Shutdown, connectivity.Idle)
 
 			// 正式创建连接（内部起一个协程，来调用到*addrConn.connect()方法）
@@ -245,6 +245,7 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 		// CONNECTING transitions to prevent the aggregated state from being
 		// always CONNECTING when many backends exist but are all down.
 		if s == connectivity.Idle {
+			// 这里发生在连接失败，重试的过程中。连接失败后，resetTransport()函数会先设置状态为TransientFailure，然后再设置为Idle状态
 			sc.Connect()
 		}
 		return
@@ -276,7 +277,7 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 	//    (may need to update error message)
 	if (s == connectivity.Ready) != (oldS == connectivity.Ready) ||
 		b.state == connectivity.TransientFailure {
-		//   新老状态只有一个为Ready (这意味着连接状态发生了变化，从Ready变成非Ready，或者从非Ready变成了Ready，这两种情况都要更新Picker)
+		//   新老状态只有一个为Ready (这意味着连接状态发生了变化，从Ready变成非Ready，或者从非Ready变成了Ready，这两种情况都要更新Picker，从而把失败的连接从picker中清除掉，后面再次连接成功后，会再生成picker的。)
 		// 或者
 		//   聚合状态为TransientFailure 时，重新生成Picker
 		b.regeneratePicker()

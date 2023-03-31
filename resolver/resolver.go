@@ -277,6 +277,9 @@ type ResolveNowOptions struct{}
 // Resolver watches for the updates on the specified target.
 // Updates include address updates and service config updates.
 type Resolver interface {
+	// ResolveNow 会被grpc调用，来尝试去重新做一次域名解析。这只是提示，resolver如果认为没有必要，可以忽略。
+	// 它可能被并行的调用多次
+
 	// ResolveNow will be called by gRPC to try to resolve the target name
 	// again. It's just a hint, resolver can ignore this if it's not necessary.
 	//

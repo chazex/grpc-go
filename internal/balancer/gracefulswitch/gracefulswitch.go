@@ -341,6 +341,7 @@ func (bw *balancerWrapper) UpdateState(state balancer.State) {
 		}
 
 		// 走到这里的情况是：balancer建立了一个新的READY的连接(因为连接建立是异步的)，所以要更新picker.
+		fmt.Println("更新picker")
 
 		// Even if there is a pending balancer waiting to be gracefully switched to,
 		// continue to forward current balancer updates to the Client Conn. Ignoring

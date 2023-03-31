@@ -738,6 +738,11 @@ func (l *listenSocket) Close() error {
 	return err
 }
 
+// Serve 接受lis上到来的连接，创建一个新的ServerTransport（http2连接），并且为每一个ServerTransport启动一个服务协程。
+// 服务协程读取rpc请求，然后调用注册的handler来处理他们。
+// Serve方法会在lis.Accept失败时返回。
+// lis将会随着方法的返回而关闭。
+
 // Serve accepts incoming connections on the listener lis, creating a new
 // ServerTransport and service goroutine for each. The service goroutines
 // read gRPC requests and then call the registered handlers to reply to them.
@@ -770,6 +775,7 @@ func (s *Server) Serve(lis net.Listener) error {
 	defer func() {
 		s.mu.Lock()
 		if s.lis != nil && s.lis[ls] {
+			// 关闭 tcp lis
 			ls.Close()
 			delete(s.lis, ls)
 		}
@@ -787,11 +793,13 @@ func (s *Server) Serve(lis net.Listener) error {
 
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
+		// 接受到新连接
 		rawConn, err := lis.Accept()
 		if err != nil {
 			if ne, ok := err.(interface {
 				Temporary() bool
 			}); ok && ne.Temporary() {
+				// 临时性错误, 执行性退避重试
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -807,11 +815,15 @@ func (s *Server) Serve(lis net.Listener) error {
 				select {
 				case <-timer.C:
 				case <-s.quit.Done():
+					// 收到退出信号
 					timer.Stop()
 					return nil
 				}
+				// 延迟时间到后，继续接收连接
 				continue
 			}
+
+			// 非临时性错误
 			s.mu.Lock()
 			s.printf("done serving; Accept = %v", err)
 			s.mu.Unlock()
@@ -828,6 +840,8 @@ func (s *Server) Serve(lis net.Listener) error {
 		// Make sure we account for the goroutine so GracefulStop doesn't nil out
 		// s.conns before this conn can be added.
 		s.serveWG.Add(1)
+		// 启动服务协程，处理新连接
+		// 1. 内部会创建http2连接
 		go func() {
 			s.handleRawConn(lis.Addr().String(), rawConn)
 			s.serveWG.Done()
@@ -844,6 +858,7 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	}
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
 
+	// 创建http2连接，实际上是(*http2Server)
 	// Finish handshaking (HTTP2)
 	st := s.newHTTP2Transport(rawConn)
 	rawConn.SetDeadline(time.Time{})
@@ -855,6 +870,7 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 		return
 	}
 	go func() {
+		// 启动一个协程，单独处理一个http2的连接
 		s.serveStreams(st)
 		s.removeConn(lisAddr, st)
 	}()
@@ -908,11 +924,14 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 	return st
 }
 
+// 针对一个http2连接的处理函数。 st是http2连接, 实际上是(*http2Server)
 func (s *Server) serveStreams(st transport.ServerTransport) {
 	defer st.Close()
 	var wg sync.WaitGroup
 
+	// http2 处理stream
 	var roundRobinCounter uint32
+	// 这里的st指的是http2连接
 	st.HandleStreams(func(stream *transport.Stream) {
 		wg.Add(1)
 		if s.opts.numServerWorkers > 0 {
@@ -1009,6 +1028,7 @@ func (s *Server) traceInfo(st transport.ServerTransport, stream *transport.Strea
 	return trInfo
 }
 
+// st 指的是http2连接
 func (s *Server) addConn(addr string, st transport.ServerTransport) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1023,6 +1043,7 @@ func (s *Server) addConn(addr string, st transport.ServerTransport) bool {
 	}
 
 	if s.conns[addr] == nil {
+		// 这里我的理解是：针对每个client ip addr，映射其所有的http2 conn
 		// Create a map entry if this is the first connection on this listener.
 		s.conns[addr] = make(map[transport.ServerTransport]bool)
 	}
@@ -1292,10 +1313,13 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 		return nil
 	}
 	ctx := NewContextWithServerTransportStream(stream.Context(), stream)
+	// 调用请求对应的方法（proto文件生成的文件中）
 	reply, appErr := md.Handler(info.serviceImpl, ctx, df, s.opts.unaryInt)
 	if appErr != nil {
+		// 方法返回了error时，转换成grpc的status
 		appStatus, ok := status.FromError(appErr)
 		if !ok {
+			// 转换失败时，尝试从context里面判断，是否为超时错误，或者取消错误。
 			// Convert non-status application error to a status error with code
 			// Unknown, but handle context errors specifically.
 			appStatus = status.FromContextError(appErr)
@@ -1305,6 +1329,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			trInfo.tr.LazyLog(stringer(appStatus.Message()), true)
 			trInfo.tr.SetError()
 		}
+		// 写status（status类似于http的header）
 		if e := t.WriteStatus(stream, appStatus); e != nil {
 			channelz.Warningf(logger, s.channelzID, "grpc: Server.processUnaryRPC failed to write status: %v", e)
 		}
@@ -1603,6 +1628,8 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 	return err
 }
 
+// 处理请求
+// t http2连接
 func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream, trInfo *traceInfo) {
 	sm := stream.Method()
 	if sm != "" && sm[0] == '/' {
@@ -1633,10 +1660,12 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Str
 	srv, knownService := s.services[service]
 	if knownService {
 		if md, ok := srv.methods[method]; ok {
+			// 处理unary rpc请求
 			s.processUnaryRPC(t, stream, srv, md, trInfo)
 			return
 		}
 		if sd, ok := srv.streams[method]; ok {
+			// 处理stream rpc
 			s.processStreamingRPC(t, stream, srv, sd, trInfo)
 			return
 		}

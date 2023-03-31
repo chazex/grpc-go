@@ -291,6 +291,10 @@ type PickResult struct {
 // default.
 func TransientFailureError(e error) error { return e }
 
+// Picker 被gRPC用来选择SubConn，从而用SubConn发送RPC请求。
+// Balancer 每次Balancer的内部状态发生改变的时候，会从它当前快照中（就是依据此刻的状态）生成一个新的picker
+// gRPC使用的pickers可以通过ClientConn.UpdateState() 这个方法来更新
+
 // Picker is used by gRPC to pick a SubConn to send an RPC.
 // Balancer is expected to generate a new picker from its snapshot every time its
 // internal state has changed.
@@ -318,6 +322,11 @@ type Picker interface {
 	//   status code Unavailable.
 	Pick(info PickInfo) (PickResult, error)
 }
+
+// Balancer 从gRPC获取输入，管理SubConns，收集并聚合连接状态
+// 它会生成更新更新gRPC用于做RPC调用时所使用的picker，picker可以获取RPC调用时需要的SubConns
+// UpdateClientConnState, ResolverError, UpdateSubConnState, Close 这几个方法可以保证是在同一个goroutine中被同步
+// 调用的。picker.Pick没有任何保证，可以随时调用
 
 // Balancer takes input from gRPC, manages SubConns, and collects and aggregates
 // the connectivity states.

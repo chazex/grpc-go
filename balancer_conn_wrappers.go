@@ -20,6 +20,7 @@ package grpc
 
 import (
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -145,6 +146,7 @@ func (ccb *ccBalancerWrapper) watcher() {
 			case *subConnUpdate:
 				// 清除连接
 				// 触发场景：1. 在新的一次Resolver服务发现的过程中，某个地址已经被删除。此时需要移除对应的连接
+				// 触发场景：2. 某个服务地址连接出现错误，在尝试一定次数的重连后，仍然失败
 				ccb.handleRemoveSubConn(update.acbw)
 			default:
 				logger.Errorf("ccBalancerWrapper.watcher: unknown update %+v, type %T", update, update)
@@ -346,6 +348,7 @@ func (ccb *ccBalancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer
 }
 
 func (ccb *ccBalancerWrapper) RemoveSubConn(sc balancer.SubConn) {
+	debug.PrintStack()
 	// Before we switched the ccBalancerWrapper to use gracefulswitch.Balancer, it
 	// was required to handle the RemoveSubConn() method asynchronously by pushing
 	// the update onto the update channel. This was done to avoid a deadlock as
@@ -441,6 +444,7 @@ func (acbw *acBalancerWrapper) UpdateAddresses(addrs []resolver.Address) {
 func (acbw *acBalancerWrapper) Connect() {
 	acbw.mu.Lock()
 	defer acbw.mu.Unlock()
+	//debug.PrintStack()
 	go acbw.ac.connect()
 }
 

@@ -16,6 +16,8 @@
  *
  */
 
+// codes包定义了用于gRPC的标准的错误码。它在各个语言中保持一致。
+
 // Package codes defines the canonical error codes used by gRPC. It is
 // consistent across various languages.
 package codes // import "google.golang.org/grpc/codes"
@@ -32,6 +34,8 @@ const (
 	// OK is returned on success.
 	OK Code = 0
 
+	// Canceled 表明这个操作被取消（通常是调用者）
+	// 当请求取消时会产生这个错误码
 	// Canceled indicates the operation was canceled (typically by the caller).
 	//
 	// The gRPC framework will generate this error code when cancellation
@@ -227,6 +231,7 @@ func (c *Code) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("nil receiver passed to UnmarshalJSON")
 	}
 
+	// 如果b是数字，转换为code
 	if ci, err := strconv.ParseUint(string(b), 10, 32); err == nil {
 		if ci >= _maxCode {
 			return fmt.Errorf("invalid code: %q", ci)
@@ -236,6 +241,7 @@ func (c *Code) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 
+	// 如果是字符串，通过映射，转换为code
 	if jc, ok := strToCode[string(b)]; ok {
 		*c = jc
 		return nil

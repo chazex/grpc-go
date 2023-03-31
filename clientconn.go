@@ -792,6 +792,7 @@ func (cc *ClientConn) newAddrConn(addrs []resolver.Address, opts balancer.NewSub
 // removeAddrConn removes the addrConn in the subConn from clientConn.
 // It also tears down the ac with the given error.
 func (cc *ClientConn) removeAddrConn(ac *addrConn, err error) {
+	//debug.PrintStack()
 	cc.mu.Lock()
 	if cc.conns == nil {
 		cc.mu.Unlock()
@@ -852,6 +853,7 @@ func (ac *addrConn) connect() error {
 		return nil
 	}
 
+	fmt.Println("更新为connecting")
 	// 更新连接状态为 Connecting
 	// 在锁内更新连接状态，以防止后续或并发调用多次重置传输。
 
@@ -1174,6 +1176,8 @@ type addrConn struct {
 
 // Note: this requires a lock on ac.mu.
 func (ac *addrConn) updateConnectivityState(s connectivity.State, lastErr error) {
+	fmt.Printf("updateConnectivityState\tstate:%v\n", s)
+	//debug.PrintStack()
 	if ac.state == s {
 		return
 	}
@@ -1229,7 +1233,9 @@ func (ac *addrConn) resetTransport() {
 	ac.updateConnectivityState(connectivity.Connecting, nil)
 	ac.mu.Unlock()
 
+	fmt.Println("try alladdres  ", addrs)
 	if err := ac.tryAllAddrs(addrs, connectDeadline); err != nil {
+		// 连接失败，此时主动触发
 		ac.cc.resolveNow(resolver.ResolveNowOptions{})
 		// After exhausting all addresses, the addrConn enters
 		// TRANSIENT_FAILURE.
@@ -1259,6 +1265,7 @@ func (ac *addrConn) resetTransport() {
 
 		ac.mu.Lock()
 		if ac.state != connectivity.Shutdown {
+			// 更新状态为Idle，为了下次重试
 			ac.updateConnectivityState(connectivity.Idle, err)
 		}
 		ac.mu.Unlock()
@@ -1327,7 +1334,9 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 	hctx, hcancel := context.WithCancel(ac.ctx)
 	hcStarted := false // protected by ac.mu
 
+	// 这里设置了连接出现异常的时候的处理函数
 	onClose := func() {
+		fmt.Println("连接(SubConn)发生了关闭, 如果不为shutdown，则会更新状态为Idle")
 		ac.mu.Lock()
 		defer ac.mu.Unlock()
 		defer connClosed.Fire()
@@ -1391,6 +1400,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 			// onClose called first; go idle but do nothing else.
 			if ac.state != connectivity.Shutdown {
 				// 发送更新子连接状态事件*scStateUpdate
+				fmt.Println("idle33333333333333333333333333")
 				ac.updateConnectivityState(connectivity.Idle, nil)
 			}
 			return nil
