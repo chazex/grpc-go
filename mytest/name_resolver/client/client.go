@@ -85,7 +85,9 @@ func InitRpc() {
 
 	// 注册 负载均衡器
 	balancer.Register(base.NewBalancerBuilder("color", ColorPickerBuilder{}, base.Config{HealthCheck: false}))
-
+	//var opts []grpc.DialOption
+	//opts = append(opts, grpc.WithUnaryInterceptor(ClientInterceptor2))
+	//opts = append(opts, grpc.WithChainUnaryInterceptor(ClientInterceptor, ClientInterceptor2))
 	// 修改连接的地址，使用自定义的 name resolver
 	conn, err := grpc.Dial(fmt.Sprintf("%s:///%s", b.Scheme(), "echo"),
 		grpc.WithInsecure(),
@@ -110,7 +112,7 @@ func InitRpc() {
 			log.Fatalf("echo failed :%#v", err.Error())
 		}
 		log.Print(r.GetMessage())
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
 	for i := 0; i < 10; i++ {

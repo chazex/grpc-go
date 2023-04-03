@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"google.golang.org/grpc/internal/balancer/stub"
+	"google.golang.org/grpc/balancer"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/xds/internal/balancer/ringhash"
 	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
@@ -89,14 +89,6 @@ func TestDiscoveryMechanismTypeUnmarshalJSON(t *testing.T) {
 			}
 		})
 	}
-}
-
-func init() {
-	// This is needed now for the config parsing tests to pass. Otherwise they
-	// will fail with "RING_HASH unsupported".
-	//
-	// TODO: delete this once ring-hash policy is implemented and imported.
-	stub.Register(rhName, stub.BalancerFuncs{})
 }
 
 const (
@@ -169,7 +161,9 @@ const (
 
 var testLRSServerConfig = &bootstrap.ServerConfig{
 	ServerURI: "trafficdirector.googleapis.com:443",
-	CredsType: "google_default",
+	Creds: bootstrap.ChannelCreds{
+		Type: "google_default",
+	},
 }
 
 func TestParseConfig(t *testing.T) {
@@ -195,7 +189,7 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
 					},
 				},
 				XDSLBPolicy: nil,
@@ -212,7 +206,7 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
 					},
 					{
 						Type: DiscoveryMechanismTypeLogicalDNS,
@@ -232,7 +226,7 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
 					},
 				},
 				XDSLBPolicy: &internalserviceconfig.BalancerConfig{
@@ -252,12 +246,12 @@ func TestParseConfig(t *testing.T) {
 						LoadReportingServer:   testLRSServerConfig,
 						MaxConcurrentRequests: newUint32(testMaxRequests),
 						Type:                  DiscoveryMechanismTypeEDS,
-						EDSServiceName:        testEDSServcie,
+						EDSServiceName:        testEDSService,
 					},
 				},
 				XDSLBPolicy: &internalserviceconfig.BalancerConfig{
 					Name:   ringhash.Name,
-					Config: nil,
+					Config: &ringhash.LBConfig{MinRingSize: 1024, MaxRingSize: 4096}, // Ringhash LB config with default min and max.
 				},
 			},
 			wantErr: false,
@@ -269,10 +263,21 @@ func TestParseConfig(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
+		b := balancer.Get(Name)
+		if b == nil {
+			t.Fatalf("LB policy %q not registered", Name)
+		}
+		cfgParser, ok := b.(balancer.ConfigParser)
+		if !ok {
+			t.Fatalf("LB policy %q does not support config parsing", Name)
+		}
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseConfig([]byte(tt.js))
+			got, err := cfgParser.ParseConfig([]byte(tt.js))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("parseConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
 			}
 			if diff := cmp.Diff(got, tt.want); diff != "" {
 				t.Errorf("parseConfig() got unexpected output, diff (-got +want): %v", diff)

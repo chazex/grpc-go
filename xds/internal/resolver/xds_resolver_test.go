@@ -28,44 +28,60 @@ import (
 	"time"
 
 	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	xdscreds "google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/envconfig"
-	"google.golang.org/grpc/internal/grpcrand"
+	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpctest"
 	iresolver "google.golang.org/grpc/internal/resolver"
 	"google.golang.org/grpc/internal/testutils"
+	xdsbootstrap "google.golang.org/grpc/internal/testutils/xds/bootstrap"
+	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	"google.golang.org/grpc/internal/wrr"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/status"
-	_ "google.golang.org/grpc/xds/internal/balancer/cdsbalancer" // To parse LB config
 	"google.golang.org/grpc/xds/internal/balancer/clustermanager"
 	"google.golang.org/grpc/xds/internal/balancer/ringhash"
 	"google.golang.org/grpc/xds/internal/httpfilter"
 	"google.golang.org/grpc/xds/internal/httpfilter/router"
+	xdstestutils "google.golang.org/grpc/xds/internal/testutils"
 	"google.golang.org/grpc/xds/internal/testutils/fakeclient"
 	"google.golang.org/grpc/xds/internal/xdsclient"
 	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	v3routerpb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	v3httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	v3discoverypb "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+
+	_ "google.golang.org/grpc/xds/internal/balancer/cdsbalancer" // To parse LB config
 )
 
 const (
 	targetStr               = "target"
 	routeStr                = "route"
 	cluster                 = "cluster"
-	defaultTestTimeout      = 1 * time.Second
+	defaultTestTimeout      = 10 * time.Second
 	defaultTestShortTimeout = 100 * time.Microsecond
 )
 
-var target = resolver.Target{Endpoint: targetStr, URL: url.URL{Scheme: "xds", Path: "/" + targetStr}}
+var target = resolver.Target{URL: *testutils.MustParseURL("xds:///" + targetStr)}
 
 var routerFilter = xdsresource.HTTPFilter{Name: "rtr", Filter: httpfilter.Get(router.TypeURL)}
-var routerFilterList = []xdsresource.HTTPFilter{routerFilter}
 
 type s struct {
 	grpctest.Tester
@@ -76,15 +92,14 @@ func Test(t *testing.T) {
 }
 
 func (s) TestRegister(t *testing.T) {
-	b := resolver.Get(xdsScheme)
-	if b == nil {
+	if resolver.Get(xdsScheme) == nil {
 		t.Errorf("scheme %v is not registered", xdsScheme)
 	}
 }
 
-// testClientConn is a fake implemetation of resolver.ClientConn. All is does
-// is to store the state received from the resolver locally and signal that
-// event through a channel.
+// testClientConn is a fake implemetation of resolver.ClientConn that pushes
+// state updates and errors returned by the resolver on to channels for
+// consumption by tests.
 type testClientConn struct {
 	resolver.ClientConn
 	stateCh *testutils.Channel
@@ -92,12 +107,18 @@ type testClientConn struct {
 }
 
 func (t *testClientConn) UpdateState(s resolver.State) error {
+	// Tests should ideally consume all state updates, and if one happens
+	// unexpectedly, tests should catch it. Hence using `Send()` here.
 	t.stateCh.Send(s)
 	return nil
 }
 
 func (t *testClientConn) ReportError(err error) {
-	t.errorCh.Send(err)
+	// When used with a go-control-plane management server that continuously
+	// resends resources which are NACKed by the xDS client, using a `Replace()`
+	// here simplifies tests which will have access to the most recently
+	// received error.
+	t.errorCh.Replace(err)
 }
 
 func (t *testClientConn) ParseServiceConfig(jsonSC string) *serviceconfig.ParseResult {
@@ -111,44 +132,52 @@ func newTestClientConn() *testClientConn {
 	}
 }
 
-// TestResolverBuilder tests the xdsResolverBuilder's Build method with
-// different parameters.
-func (s) TestResolverBuilder(t *testing.T) {
+// TestResolverBuilder_ClientCreationFails tests the case where xDS client
+// creation fails, and verifies that xDS resolver build fails as well.
+func (s) TestResolverBuilder_ClientCreationFails(t *testing.T) {
+	// Override xDS client creation function and return an error.
+	origNewClient := newXDSClient
+	newXDSClient = func() (xdsclient.XDSClient, func(), error) {
+		return nil, nil, errors.New("failed to create xDS client")
+	}
+	defer func() {
+		newXDSClient = origNewClient
+	}()
+
+	// Build an xDS resolver and expect it to fail.
+	builder := resolver.Get(xdsScheme)
+	if builder == nil {
+		t.Fatalf("resolver.Get(%v) returned nil", xdsScheme)
+	}
+	if _, err := builder.Build(target, newTestClientConn(), resolver.BuildOptions{}); err == nil {
+		t.Fatalf("builder.Build(%v) succeeded when expected to fail", target)
+	}
+}
+
+// TestResolverBuilder_DifferentBootstrapConfigs tests the resolver builder's
+// Build() method with different xDS bootstrap configurations.
+func (s) TestResolverBuilder_DifferentBootstrapConfigs(t *testing.T) {
 	tests := []struct {
-		name          string
-		xdsClientFunc func() (xdsclient.XDSClient, error)
-		target        resolver.Target
-		wantErr       bool
+		name         string
+		bootstrapCfg *bootstrap.Config // Empty top-level xDS server config, will be set by test logic.
+		target       resolver.Target
+		buildOpts    resolver.BuildOptions
+		wantErr      string
 	}{
 		{
-			name: "simple-good",
-			xdsClientFunc: func() (xdsclient.XDSClient, error) {
-				return fakeclient.NewClient(), nil
-			},
-			target:  target,
-			wantErr: false,
-		},
-		{
-			name: "newXDSClient-throws-error",
-			xdsClientFunc: func() (xdsclient.XDSClient, error) {
-				return nil, errors.New("newXDSClient-throws-error")
-			},
-			target:  target,
-			wantErr: true,
+			name:         "good",
+			bootstrapCfg: &bootstrap.Config{},
+			target:       target,
 		},
 		{
 			name: "authority not defined in bootstrap",
-			xdsClientFunc: func() (xdsclient.XDSClient, error) {
-				c := fakeclient.NewClient()
-				c.SetBootstrapConfig(&bootstrap.Config{
-					ClientDefaultListenerResourceNameTemplate: "%s",
-					Authorities: map[string]*bootstrap.Authority{
-						"test-authority": {
-							ClientListenerResourceNameTemplate: "xdstp://test-authority/%s",
-						},
+			bootstrapCfg: &bootstrap.Config{
+				ClientDefaultListenerResourceNameTemplate: "%s",
+				Authorities: map[string]*bootstrap.Authority{
+					"test-authority": {
+						ClientListenerResourceNameTemplate: "xdstp://test-authority/%s",
 					},
-				})
-				return c, nil
+				},
 			},
 			target: resolver.Target{
 				URL: url.URL{
@@ -156,16 +185,47 @@ func (s) TestResolverBuilder(t *testing.T) {
 					Path: "/" + targetStr,
 				},
 			},
-			wantErr: true,
+			wantErr: `authority "non-existing-authority" is not found in the bootstrap file`,
+		},
+		{
+			name:         "xDS creds specified without certificate providers in bootstrap",
+			bootstrapCfg: &bootstrap.Config{},
+			target:       target,
+			buildOpts: resolver.BuildOptions{
+				DialCreds: func() credentials.TransportCredentials {
+					creds, err := xdscreds.NewClientCredentials(xdscreds.ClientOptions{FallbackCreds: insecure.NewCredentials()})
+					if err != nil {
+						t.Fatalf("xds.NewClientCredentials() failed: %v", err)
+					}
+					return creds
+				}(),
+			},
+			wantErr: `xdsCreds specified but certificate_providers config missing in bootstrap file`,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			// Fake out the xdsClient creation process by providing a fake.
-			oldClientMaker := newXDSClient
-			newXDSClient = test.xdsClientFunc
+			mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+			if err != nil {
+				t.Fatalf("Starting xDS management server: %v", err)
+			}
+			defer mgmtServer.Stop()
+
+			// Add top-level xDS server config corresponding to the above
+			// management server.
+			test.bootstrapCfg.XDSServer = xdstestutils.ServerConfigForAddress(t, mgmtServer.Address)
+
+			// Override xDS client creation to use bootstrap configuration
+			// specified by the test.
+			origNewClient := newXDSClient
+			newXDSClient = func() (xdsclient.XDSClient, func(), error) {
+				// The watch timeout and idle authority timeout values passed to
+				// NewWithConfigForTesing() are immaterial for this test, as we
+				// are only testing the resolver build functionality.
+				return xdsclient.NewWithConfigForTesting(test.bootstrapCfg, defaultTestTimeout, defaultTestTimeout)
+			}
 			defer func() {
-				newXDSClient = oldClientMaker
+				newXDSClient = origNewClient
 			}()
 
 			builder := resolver.Get(xdsScheme)
@@ -173,8 +233,11 @@ func (s) TestResolverBuilder(t *testing.T) {
 				t.Fatalf("resolver.Get(%v) returned nil", xdsScheme)
 			}
 
-			r, err := builder.Build(test.target, newTestClientConn(), resolver.BuildOptions{})
-			if (err != nil) != test.wantErr {
+			r, err := builder.Build(test.target, newTestClientConn(), test.buildOpts)
+			if gotErr, wantErr := err != nil, test.wantErr != ""; gotErr != wantErr {
+				t.Fatalf("builder.Build(%v) returned err: %v, wantErr: %v", target, err, test.wantErr)
+			}
+			if test.wantErr != "" && !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("builder.Build(%v) returned err: %v, wantErr: %v", target, err, test.wantErr)
 			}
 			if err != nil {
@@ -183,47 +246,6 @@ func (s) TestResolverBuilder(t *testing.T) {
 			}
 			r.Close()
 		})
-	}
-}
-
-// TestResolverBuilder_xdsCredsBootstrapMismatch tests the case where an xds
-// resolver is built with xds credentials being specified by the user. The
-// bootstrap file does not contain any certificate provider configuration
-// though, and therefore we expect the resolver build to fail.
-func (s) TestResolverBuilder_xdsCredsBootstrapMismatch(t *testing.T) {
-	// Fake out the xdsClient creation process by providing a fake, which does
-	// not have any certificate provider configuration.
-	fc := fakeclient.NewClient()
-	fc.SetBootstrapConfig(&bootstrap.Config{})
-	oldClientMaker := newXDSClient
-	newXDSClient = func() (xdsclient.XDSClient, error) {
-		return fc, nil
-	}
-	defer func() { newXDSClient = oldClientMaker }()
-	defer func() {
-		select {
-		case <-time.After(defaultTestTimeout):
-			t.Fatalf("timeout waiting for close")
-		case <-fc.Closed.Done():
-		}
-	}()
-
-	builder := resolver.Get(xdsScheme)
-	if builder == nil {
-		t.Fatalf("resolver.Get(%v) returned nil", xdsScheme)
-	}
-
-	// Create xds credentials to be passed to resolver.Build().
-	creds, err := xdscreds.NewClientCredentials(xdscreds.ClientOptions{FallbackCreds: insecure.NewCredentials()})
-	if err != nil {
-		t.Fatalf("xds.NewClientCredentials() failed: %v", err)
-	}
-
-	// Since the fake xds client is not configured with any certificate provider
-	// configs, and we are specifying xds credentials in the call to
-	// resolver.Build(), we expect it to fail.
-	if _, err := builder.Build(target, newTestClientConn(), resolver.BuildOptions{DialCreds: creds}); err == nil {
-		t.Fatal("builder.Build() succeeded when expected to fail")
 	}
 }
 
@@ -240,8 +262,9 @@ func testSetup(t *testing.T, opts setupOpts) (*xdsResolver, *fakeclient.Client, 
 		fc.SetBootstrapConfig(opts.bootstrapC)
 	}
 	oldClientMaker := newXDSClient
-	newXDSClient = func() (xdsclient.XDSClient, error) {
-		return fc, nil
+	closeCh := make(chan struct{})
+	newXDSClient = func() (xdsclient.XDSClient, func(), error) {
+		return fc, grpcsync.OnceFunc(func() { close(closeCh) }), nil
 	}
 	cancel := func() {
 		// Make sure the xDS client is closed, in all (successful or failed)
@@ -249,7 +272,7 @@ func testSetup(t *testing.T, opts setupOpts) (*xdsResolver, *fakeclient.Client, 
 		select {
 		case <-time.After(defaultTestTimeout):
 			t.Fatalf("timeout waiting for close")
-		case <-fc.Closed.Done():
+		case <-closeCh:
 		}
 		newXDSClient = oldClientMaker
 	}
@@ -299,266 +322,494 @@ func waitForWatchRouteConfig(ctx context.Context, t *testing.T, xdsC *fakeclient
 	}
 }
 
-// TestXDSResolverResourceNameToWatch tests that the correct resource name is
-// used to watch for the service. This covers cases with different bootstrap
-// config, and different authority.
-func (s) TestXDSResolverResourceNameToWatch(t *testing.T) {
+// buildResolverForTarget builds an xDS resolver for the given target. It
+// returns a testClientConn which allows inspection of resolver updates, and a
+// function to close the resolver once the test is complete.
+func buildResolverForTarget(t *testing.T, target resolver.Target) (*testClientConn, func()) {
+	builder := resolver.Get(xdsScheme)
+	if builder == nil {
+		t.Fatalf("resolver.Get(%v) returned nil", xdsScheme)
+	}
+
+	tcc := newTestClientConn()
+	r, err := builder.Build(target, tcc, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatalf("builder.Build(%v) returned err: %v", target, err)
+	}
+	return tcc, r.Close
+}
+
+// TestResolverResourceName builds an xDS resolver and verifies that the
+// resource name specified in the discovery request matches expectations.
+func (s) TestResolverResourceName(t *testing.T) {
+	// Federation support is required when new style names are used.
+	oldXDSFederation := envconfig.XDSFederation
+	envconfig.XDSFederation = true
+	defer func() { envconfig.XDSFederation = oldXDSFederation }()
+
 	tests := []struct {
-		name   string
-		bc     *bootstrap.Config
-		target resolver.Target
-		want   string
+		name                         string
+		listenerResourceNameTemplate string
+		extraAuthority               string
+		dialTarget                   string
+		wantResourceName             string
 	}{
 		{
-			name: "default %s old style",
-			bc: &bootstrap.Config{
-				ClientDefaultListenerResourceNameTemplate: "%s",
-			},
-			target: resolver.Target{
-				URL: url.URL{Path: "/" + targetStr},
-			},
-			want: targetStr,
+			name:                         "default %s old style",
+			listenerResourceNameTemplate: "%s",
+			dialTarget:                   "xds:///target",
+			wantResourceName:             "target",
 		},
 		{
-			name: "old style no percent encoding",
-			bc: &bootstrap.Config{
-				ClientDefaultListenerResourceNameTemplate: "/path/to/%s",
-			},
-			target: resolver.Target{
-				URL: url.URL{Path: "/" + targetStr},
-			},
-			want: "/path/to/" + targetStr,
+			name:                         "old style no percent encoding",
+			listenerResourceNameTemplate: "/path/to/%s",
+			dialTarget:                   "xds:///target",
+			wantResourceName:             "/path/to/target",
 		},
 		{
-			name: "new style with %s",
-			bc: &bootstrap.Config{
-				ClientDefaultListenerResourceNameTemplate: "xdstp://authority.com/%s",
-				Authorities: nil,
-			},
-			target: resolver.Target{
-				URL: url.URL{Path: "/0.0.0.0:8080"},
-			},
-			want: "xdstp://authority.com/0.0.0.0:8080",
+			name:                         "new style with %s",
+			listenerResourceNameTemplate: "xdstp://authority.com/%s",
+			dialTarget:                   "xds:///0.0.0.0:8080",
+			wantResourceName:             "xdstp://authority.com/0.0.0.0:8080",
 		},
 		{
-			name: "new style percent encoding",
-			bc: &bootstrap.Config{
-				ClientDefaultListenerResourceNameTemplate: "xdstp://authority.com/%s",
-				Authorities: nil,
-			},
-			target: resolver.Target{
-				URL: url.URL{Path: "/[::1]:8080"},
-			},
-			want: "xdstp://authority.com/%5B::1%5D:8080",
+			name:                         "new style percent encoding",
+			listenerResourceNameTemplate: "xdstp://authority.com/%s",
+			dialTarget:                   "xds:///[::1]:8080",
+			wantResourceName:             "xdstp://authority.com/%5B::1%5D:8080",
 		},
 		{
-			name: "new style different authority",
-			bc: &bootstrap.Config{
-				ClientDefaultListenerResourceNameTemplate: "xdstp://authority.com/%s",
-				Authorities: map[string]*bootstrap.Authority{
-					"test-authority": {
-						ClientListenerResourceNameTemplate: "xdstp://test-authority/%s",
-					},
-				},
-			},
-			target: resolver.Target{
-				URL: url.URL{
-					Host: "test-authority",
-					Path: "/" + targetStr,
-				},
-			},
-			want: "xdstp://test-authority/" + targetStr,
+			name:                         "new style different authority",
+			listenerResourceNameTemplate: "xdstp://authority.com/%s",
+			extraAuthority:               "test-authority",
+			dialTarget:                   "xds://test-authority/target",
+			wantResourceName:             "xdstp://test-authority/envoy.config.listener.v3.Listener/target",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			xdsR, xdsC, _, cancel := testSetup(t, setupOpts{
-				bootstrapC: tt.bc,
-				target:     tt.target,
+			// Setup the management server to push the requested resource name
+			// on to a channel. No resources are configured on the management
+			// server as part of this test, as we are only interested in the
+			// resource name being requested.
+			resourceNameCh := make(chan string, 1)
+			mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{
+				OnStreamRequest: func(_ int64, req *v3discoverypb.DiscoveryRequest) error {
+					// When the resolver is being closed, the watch associated
+					// with the listener resource will be cancelled, and it
+					// might result in a discovery request with no resource
+					// names. Hence, we only consider requests which contain a
+					// resource name.
+					var name string
+					if len(req.GetResourceNames()) == 1 {
+						name = req.GetResourceNames()[0]
+					}
+					select {
+					case resourceNameCh <- name:
+					default:
+					}
+					return nil
+				},
 			})
-			defer cancel()
-			defer xdsR.Close()
+			if err != nil {
+				t.Fatalf("Failed to start xDS management server: %v", err)
+			}
+			defer mgmtServer.Stop()
 
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-			defer cancel()
-			waitForWatchListener(ctx, t, xdsC, tt.want)
+			// Create a bootstrap configuration with test options.
+			opts := xdsbootstrap.Options{
+				ServerURI: mgmtServer.Address,
+				ClientDefaultListenerResourceNameTemplate: tt.listenerResourceNameTemplate,
+			}
+			if tt.extraAuthority != "" {
+				// In this test, we really don't care about having multiple
+				// management servers. All we need to verify is whether the
+				// resource name matches expectation.
+				opts.Authorities = map[string]string{
+					tt.extraAuthority: mgmtServer.Address,
+				}
+			}
+			cleanup, err := xdsbootstrap.CreateFile(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			_, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL(tt.dialTarget)})
+			defer rClose()
+
+			// Verify the resource name in the discovery request being sent out.
+			select {
+			case gotResourceName := <-resourceNameCh:
+				if gotResourceName != tt.wantResourceName {
+					t.Fatalf("Received discovery request with resource name: %v, want %v", gotResourceName, tt.wantResourceName)
+				}
+			case <-time.After(defaultTestTimeout):
+				t.Fatalf("Timeout when waiting for discovery request")
+			}
 		})
 	}
 }
 
-// TestXDSResolverWatchCallbackAfterClose tests the case where a service update
-// from the underlying xdsClient is received after the resolver is closed.
-func (s) TestXDSResolverWatchCallbackAfterClose(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer cancel()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-
-	// Call the watchAPI callback after closing the resolver, and make sure no
-	// update is triggerred on the ClientConn.
-	xdsR.Close()
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
-			},
+// TestResolverWatchCallbackAfterClose tests the case where a service update
+// from the underlying xDS client is received after the resolver is closed, and
+// verifies that the update is not propagated to the ClientConn.
+func (s) TestResolverWatchCallbackAfterClose(t *testing.T) {
+	// Setup the management server that synchronizes with the test goroutine
+	// using two channels. The management server signals the test goroutine when
+	// it receives a discovery request for a route configuration resource. And
+	// the test goroutine signals the management server when the resolver is
+	// closed.
+	waitForRouteConfigDiscoveryReqCh := make(chan struct{}, 1)
+	waitForResolverCloseCh := make(chan struct{})
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{
+		OnStreamRequest: func(_ int64, req *v3discoverypb.DiscoveryRequest) error {
+			if req.GetTypeUrl() == version.V3RouteConfigURL {
+				select {
+				case waitForRouteConfigDiscoveryReqCh <- struct{}{}:
+				default:
+				}
+				<-waitForResolverCloseCh
+			}
+			return nil
 		},
-	}, nil)
-
-	if gotVal, gotErr := tcc.stateCh.Receive(ctx); gotErr != context.DeadlineExceeded {
-		t.Fatalf("ClientConn.UpdateState called after xdsResolver is closed: %v", gotVal)
+	})
+	if err != nil {
+		t.Fatalf("Failed to start xDS management server: %v", err)
 	}
-}
+	defer mgmtServer.Stop()
 
-// TestXDSResolverCloseClosesXDSClient tests that the XDS resolver's Close
-// method closes the XDS client.
-func (s) TestXDSResolverCloseClosesXDSClient(t *testing.T) {
-	xdsR, xdsC, _, cancel := testSetup(t, setupOpts{target: target})
-	defer cancel()
-	xdsR.Close()
-	if !xdsC.Closed.HasFired() {
-		t.Fatalf("xds client not closed by xds resolver Close method")
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	defer cleanup()
 
-// TestXDSResolverBadServiceUpdate tests the case the xdsClient returns a bad
-// service update.
-func (s) TestXDSResolverBadServiceUpdate(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
-
+	// Configure listener and route configuration resources on the management
+	// server.
+	const serviceName = "my-service-client-side-xds"
+	rdsName := "route-" + serviceName
+	cdsName := "cluster-" + serviceName
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(serviceName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, serviceName, cdsName)},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	// Invoke the watchAPI callback with a bad service update and wait for the
-	// ReportError method to be called on the ClientConn.
-	suErr := errors.New("bad serviceupdate")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr)
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
 
-	if gotErrVal, gotErr := tcc.errorCh.Receive(ctx); gotErr != nil || gotErrVal != suErr {
-		t.Fatalf("ClientConn.ReportError() received %v, want %v", gotErrVal, suErr)
+	// Wait for a discovery request for a route configuration resource.
+	select {
+	case <-waitForRouteConfigDiscoveryReqCh:
+	case <-ctx.Done():
+		t.Fatal("Timeout when waiting for a discovery request for a route configuration resource")
+	}
+
+	// Close the resolver and unblock the management server.
+	rClose()
+	close(waitForResolverCloseCh)
+
+	// Verify that the update from the management server is not propagated to
+	// the ClientConn. The xDS resolver, once closed, is expected to drop
+	// updates from the xDS client.
+	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	if _, err := tcc.stateCh.Receive(sCtx); err != context.DeadlineExceeded {
+		t.Fatalf("ClientConn received an update from the resolver that was closed: %v", err)
 	}
 }
 
-// TestXDSResolverGoodServiceUpdate tests the happy case where the resolver
-// gets a good service update from the xdsClient.
-func (s) TestXDSResolverGoodServiceUpdate(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
+// TestResolverCloseClosesXDSClient tests that the xDS resolver's Close method
+// closes the xDS client.
+func (s) TestResolverCloseClosesXDSClient(t *testing.T) {
+	bootstrapCfg := &bootstrap.Config{
+		XDSServer: xdstestutils.ServerConfigForAddress(t, "dummy-management-server-address"),
+	}
 
+	// Override xDS client creation to use bootstrap configuration pointing to a
+	// dummy management server. Also close a channel when the returned xDS
+	// client is closed.
+	closeCh := make(chan struct{})
+	origNewClient := newXDSClient
+	newXDSClient = func() (xdsclient.XDSClient, func(), error) {
+		c, cancel, err := xdsclient.NewWithConfigForTesting(bootstrapCfg, defaultTestTimeout, defaultTestTimeout)
+		return c, func() {
+			close(closeCh)
+			cancel()
+		}, err
+	}
+	defer func() {
+		newXDSClient = origNewClient
+	}()
+
+	_, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///my-service-client-side-xds")})
+	rClose()
+
+	select {
+	case <-closeCh:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("Timeout when waiting for xDS client to be closed")
+	}
+}
+
+// TestResolverBadServiceUpdate tests the case where a resource returned by the
+// management server is NACKed by the xDS client, which then returns an update
+// containing an error to the resolver. Verifies that the update is propagated
+// to the ClientConn by the resolver. It also tests the cases where the resolver
+// gets a good update subsequently, and another error after the good update.
+func (s) TestResolverBadServiceUpdate(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
+
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	// Configure a listener resource that is expected to be NACKed because it
+	// does not contain the `RouteSpecifier` field in the HTTPConnectionManager.
+	hcm := testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+		HttpFilters: []*v3httppb.HttpFilter{e2e.HTTPFilter("router", &v3routerpb.Router{})},
+	})
+	lis := &v3listenerpb.Listener{
+		Name:        serviceName,
+		ApiListener: &v3listenerpb.ApiListener{ApiListener: hcm},
+		FilterChains: []*v3listenerpb.FilterChain{{
+			Name: "filter-chain-name",
+			Filters: []*v3listenerpb.Filter{{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &v3listenerpb.Filter_TypedConfig{TypedConfig: hcm},
+			}},
+		}},
+	}
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{lis},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-	defer replaceRandNumGenerator(0)()
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
+	wantErr := "no RouteSpecifier"
+	val, err := tcc.errorCh.Receive(ctx)
+	if err != nil {
+		t.Fatal("Timeout when waiting for error to be propagated to the ClientConn")
+	}
+	gotErr := val.(error)
+	if gotErr == nil || !strings.Contains(gotErr.Error(), wantErr) {
+		t.Fatalf("Received error from resolver %q, want %q", gotErr, wantErr)
+	}
+
+	// Configure good listener and route configuration resources on the
+	// management server.
+	rdsName := "route-" + serviceName
+	cdsName := "cluster-" + serviceName
+	resources = e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(serviceName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, serviceName, cdsName)},
+		SkipValidation: true,
+	}
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect a good update from the resolver.
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState := val.(resolver.State)
+	if err := rState.ServiceConfig.Err; err != nil {
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+	}
+
+	// Configure another bad resource on the management server.
+	resources = e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{lis},
+		SkipValidation: true,
+	}
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect an error update from the resolver.
+	val, err = tcc.errorCh.Receive(ctx)
+	if err != nil {
+		t.Fatal("Timeout when waiting for error to be propagated to the ClientConn")
+	}
+	gotErr = val.(error)
+	if gotErr == nil || !strings.Contains(gotErr.Error(), wantErr) {
+		t.Fatalf("Received error from resolver %q, want %q", gotErr, wantErr)
+	}
+}
+
+// TestResolverGoodServiceUpdate tests the case where the resource returned by
+// the management server is ACKed by the xDS client, which then returns a good
+// service update to the resolver. The test verifies that the service config
+// returned by the resolver matches expectations, and that the config selector
+// returned by the resolver picks clusters based on the route configuration
+// received from the management server.
+func (s) TestResolverGoodServiceUpdate(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
+
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
 	for _, tt := range []struct {
-		routes       []*xdsresource.Route
-		wantJSON     string
-		wantClusters map[string]bool
+		routeConfig       *v3routepb.RouteConfiguration
+		wantServiceConfig string
+		wantClusters      map[string]bool
 	}{
 		{
-			routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"test-cluster-1": {Weight: 1}}}},
-			wantJSON: `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:test-cluster-1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"test-cluster-1"}}]
+			// A route configuration with a single cluster.
+			routeConfig: e2e.RouteConfigResourceWithOptions(e2e.RouteConfigOptions{
+				RouteConfigName:      rdsName,
+				ListenerName:         ldsName,
+				ClusterSpecifierType: e2e.RouteConfigClusterSpecifierTypeCluster,
+				ClusterName:          "test-cluster-1",
+			}),
+			wantServiceConfig: `
+{
+  "loadBalancingConfig": [{
+    "xds_cluster_manager_experimental": {
+      "children": {
+        "cluster:test-cluster-1": {
+          "childPolicy": [{
+			"cds_experimental": {
+			  "cluster": "test-cluster-1"
+			}
+		  }]
         }
       }
-    }}]}`,
+    }
+  }]
+}`,
 			wantClusters: map[string]bool{"cluster:test-cluster-1": true},
 		},
 		{
-			routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{
-				"cluster_1": {Weight: 75},
-				"cluster_2": {Weight: 25},
-			}}},
-			// This update contains the cluster from the previous update as
-			// well as this update, as the previous config selector still
-			// references the old cluster when the new one is pushed.
-			wantJSON: `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:test-cluster-1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"test-cluster-1"}}]
+			// A route configuration with a two new clusters.
+			routeConfig: e2e.RouteConfigResourceWithOptions(e2e.RouteConfigOptions{
+				RouteConfigName:      rdsName,
+				ListenerName:         ldsName,
+				ClusterSpecifierType: e2e.RouteConfigClusterSpecifierTypeWeightedCluster,
+				WeightedClusters:     map[string]int{"cluster_1": 75, "cluster_2": 25},
+			}),
+			// This update contains the cluster from the previous update as well
+			// as this update, as the previous config selector still references
+			// the old cluster when the new one is pushed.
+			wantServiceConfig: `
+{
+  "loadBalancingConfig": [{
+    "xds_cluster_manager_experimental": {
+      "children": {
+        "cluster:test-cluster-1": {
+          "childPolicy": [{
+			"cds_experimental": {
+			  "cluster": "test-cluster-1"
+			}
+		  }]
         },
-        "cluster:cluster_1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"cluster_1"}}]
+        "cluster:cluster_1": {
+          "childPolicy": [{
+			"cds_experimental": {
+			  "cluster": "cluster_1"
+			}
+		  }]
         },
-        "cluster:cluster_2":{
-          "childPolicy":[{"cds_experimental":{"cluster":"cluster_2"}}]
+        "cluster:cluster_2": {
+          "childPolicy": [{
+			"cds_experimental": {
+			  "cluster": "cluster_2"
+			}
+		  }]
         }
       }
-    }}]}`,
-			wantClusters: map[string]bool{"cluster:cluster_1": true, "cluster:cluster_2": true},
-		},
-		{
-			routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{
-				"cluster_1": {Weight: 75},
-				"cluster_2": {Weight: 25},
-			}}},
-			// With this redundant update, the old config selector has been
-			// stopped, so there are no more references to the first cluster.
-			// Only the second update's clusters should remain.
-			wantJSON: `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:cluster_1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"cluster_1"}}]
-        },
-        "cluster:cluster_2":{
-          "childPolicy":[{"cds_experimental":{"cluster":"cluster_2"}}]
-        }
-      }
-    }}]}`,
+    }
+  }]
+}`,
 			wantClusters: map[string]bool{"cluster:cluster_1": true, "cluster:cluster_2": true},
 		},
 	} {
-		// Invoke the watchAPI callback with a good service update and wait for the
-		// UpdateState method to be called on the ClientConn.
-		xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-			VirtualHosts: []*xdsresource.VirtualHost{
-				{
-					Domains: []string{targetStr},
-					Routes:  tt.routes,
-				},
-			},
-		}, nil)
-
+		// Configure the management server with a good listener resource and a
+		// route configuration resource, as specified by the test case.
+		resources := e2e.UpdateOptions{
+			NodeID:         nodeID,
+			Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+			Routes:         []*v3routepb.RouteConfiguration{tt.routeConfig},
+			SkipValidation: true,
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 		defer cancel()
-		gotState, err := tcc.stateCh.Receive(ctx)
-		if err != nil {
-			t.Fatalf("Error waiting for UpdateState to be called: %v", err)
-		}
-		rState := gotState.(resolver.State)
-		if err := rState.ServiceConfig.Err; err != nil {
-			t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		if err := mgmtServer.Update(ctx, resources); err != nil {
+			t.Fatal(err)
 		}
 
-		wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(tt.wantJSON)
+		// Read the update pushed by the resolver to the ClientConn.
+		val, err := tcc.stateCh.Receive(ctx)
+		if err != nil {
+			t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+		}
+		rState := val.(resolver.State)
+		if err := rState.ServiceConfig.Err; err != nil {
+			t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+		}
+
+		wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(tt.wantServiceConfig)
 		if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
-			t.Errorf("ClientConn.UpdateState received different service config")
-			t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-			t.Error("want: ", cmp.Diff(nil, wantSCParsed.Config))
+			t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 		}
 
 		cs := iresolver.GetConfigSelector(rState)
 		if cs == nil {
-			t.Error("received nil config selector")
-			continue
+			t.Fatal("Received nil config selector in update from resolver")
 		}
 
 		pickedClusters := make(map[string]bool)
@@ -566,351 +817,602 @@ func (s) TestXDSResolverGoodServiceUpdate(t *testing.T) {
 		// with the random number generator stubbed out, we can rely on this
 		// to be 100% reproducible.
 		for i := 0; i < 100; i++ {
-			res, err := cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+			res, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 			if err != nil {
-				t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+				t.Fatalf("cs.SelectConfig(): %v", err)
 			}
 			cluster := clustermanager.GetPickedClusterForTesting(res.Context)
 			pickedClusters[cluster] = true
 			res.OnCommitted()
 		}
-		if !reflect.DeepEqual(pickedClusters, tt.wantClusters) {
+		if !cmp.Equal(pickedClusters, tt.wantClusters) {
 			t.Errorf("Picked clusters: %v; want: %v", pickedClusters, tt.wantClusters)
 		}
 	}
 }
 
-// TestXDSResolverRequestHash tests a case where a resolver receives a RouteConfig update
+// TestResolverRequestHash tests a case where a resolver receives a RouteConfig update
 // with a HashPolicy specifying to generate a hash. The configSelector generated should
 // successfully generate a Hash.
-func (s) TestXDSResolverRequestHash(t *testing.T) {
+func (s) TestResolverRequestHash(t *testing.T) {
 	oldRH := envconfig.XDSRingHash
 	envconfig.XDSRingHash = true
 	defer func() { envconfig.XDSRingHash = oldRH }()
 
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-	// Invoke watchAPI callback with a good service update (with hash policies
-	// specified) and wait for UpdateState method to be called on ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes: []*xdsresource.Route{{
-					Prefix: newStringP(""),
-					WeightedClusters: map[string]xdsresource.WeightedCluster{
-						"cluster_1": {Weight: 75},
-						"cluster_2": {Weight: 25},
-					},
-					HashPolicies: []*xdsresource.HashPolicy{{
-						HashPolicyType: xdsresource.HashPolicyTypeHeader,
-						HeaderName:     ":path",
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	// Configure the management server with a good listener resource and a
+	// route configuration resource that specifies a hash policy.
+	resources := e2e.UpdateOptions{
+		NodeID:    nodeID,
+		Listeners: []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes: []*v3routepb.RouteConfiguration{{
+			Name: rdsName,
+			VirtualHosts: []*v3routepb.VirtualHost{{
+				Domains: []string{ldsName},
+				Routes: []*v3routepb.Route{{
+					Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+					Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+						ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+							Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+								{
+									Name:   "test-cluster-1",
+									Weight: &wrapperspb.UInt32Value{Value: 100},
+								},
+							},
+						}},
+						HashPolicy: []*v3routepb.RouteAction_HashPolicy{{
+							PolicySpecifier: &v3routepb.RouteAction_HashPolicy_Header_{
+								Header: &v3routepb.RouteAction_HashPolicy_Header{
+									HeaderName: ":path",
+								},
+							},
+							Terminal: true,
+						}},
 					}},
 				}},
-			},
-		},
-	}, nil)
-
-	ctx, cancel = context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	gotState, err := tcc.stateCh.Receive(ctx)
-	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+			}},
+		}},
+		SkipValidation: true,
 	}
-	rState := gotState.(resolver.State)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the update pushed by the resolver to the ClientConn.
+	val, err := tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState := val.(resolver.State)
+	if err := rState.ServiceConfig.Err; err != nil {
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+	}
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Error("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
+
 	// Selecting a config when there was a hash policy specified in the route
 	// that will be selected should put a request hash in the config's context.
-	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: metadata.NewOutgoingContext(context.Background(), metadata.Pairs(":path", "/products"))})
+	res, err := cs.SelectConfig(iresolver.RPCInfo{
+		Context: metadata.NewOutgoingContext(ctx, metadata.Pairs(":path", "/products")),
+		Method:  "/service/method",
+	})
 	if err != nil {
-		t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
-	requestHashGot := ringhash.GetRequestHashForTesting(res.Context)
-	requestHashWant := xxhash.Sum64String("/products")
-	if requestHashGot != requestHashWant {
-		t.Fatalf("requestHashGot = %v, requestHashWant = %v", requestHashGot, requestHashWant)
+	gotHash := ringhash.GetRequestHashForTesting(res.Context)
+	wantHash := xxhash.Sum64String("/products")
+	if gotHash != wantHash {
+		t.Fatalf("Got request hash: %v, want: %v", gotHash, wantHash)
 	}
 }
 
-// TestXDSResolverRemovedWithRPCs tests the case where a config selector sends
-// an empty update to the resolver after the resource is removed.
-func (s) TestXDSResolverRemovedWithRPCs(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer cancel()
-	defer xdsR.Close()
+// TestResolverRemovedWithRPCs tests the case where resources are removed from
+// the management server, causing it to send an empty update to the xDS client,
+// which returns a resource-not-found error to the xDS resolver. The test
+// verifies that an ongoing RPC is handled properly when this happens.
+func (s) TestResolverRemovedWithRPCs(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	// Configure the management server with a good listener and route
+	// configuration resource.
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, ldsName, "test-cluster-1")},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"test-cluster-1": {Weight: 1}}}},
-			},
-		},
-	}, nil)
-
-	gotState, err := tcc.stateCh.Receive(ctx)
+	// Read the update pushed by the resolver to the ClientConn.
+	val, err := tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
-	rState := gotState.(resolver.State)
+	rState := val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+	}
+	wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`
+{
+	"loadBalancingConfig": [
+		{
+		  "xds_cluster_manager_experimental": {
+			"children": {
+			  "cluster:test-cluster-1": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "test-cluster-1"
+					}
+				  }
+				]
+			  }
+			}
+		  }
+		}
+	  ]
+}`)
+	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 
-	// "Make an RPC" by invoking the config selector.
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatalf("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
-
-	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err != nil {
-		t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
 
-	// Delete the resource
-	suErr := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "resource removed error")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr)
+	// Delete the resources on the management server. This should result in a
+	// resource-not-found error from the xDS client.
+	if err := mgmtServer.Update(ctx, e2e.UpdateOptions{NodeID: nodeID}); err != nil {
+		t.Fatal(err)
+	}
 
-	if _, err = tcc.stateCh.Receive(ctx); err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+	// The RPC started earlier is still in progress. So, the xDS resolver will
+	// not produce an empty service config at this point. Instead it will retain
+	// the cluster to which the RPC is ongoing in the service config, but will
+	// return an erroring config selector which will fail new RPCs.
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState = val.(resolver.State)
+	if err := rState.ServiceConfig.Err; err != nil {
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+	}
+	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
+	}
+	cs = iresolver.GetConfigSelector(rState)
+	if cs == nil {
+		t.Fatal("Received nil config selector in update from resolver")
+	}
+	_, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
+	if err == nil || status.Code(err) != codes.Unavailable {
+		t.Fatalf("cs.SelectConfig() returned: %v, want: %v", err, codes.Unavailable)
 	}
 
 	// "Finish the RPC"; this could cause a panic if the resolver doesn't
 	// handle it correctly.
 	res.OnCommitted()
+
+	// Now that the RPC is committed, the xDS resolver is expected to send an
+	// update with an empty service config.
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState = val.(resolver.State)
+	if err := rState.ServiceConfig.Err; err != nil {
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
+	}
+	wantSCParsed = internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`{}`)
+	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
+	}
 }
 
-// TestXDSResolverRemovedResource tests for proper behavior after a resource is
-// removed.
-func (s) TestXDSResolverRemovedResource(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer cancel()
-	defer xdsR.Close()
+// TestResolverRemovedResource tests the case where resources returned by the
+// management server are removed. The test verifies that the resolver pushes the
+// expected config selector and service config in this case.
+func (s) TestResolverRemovedResource(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	// Configure the management server with a good listener and route
+	// configuration resource.
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, ldsName, "test-cluster-1")},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"test-cluster-1": {Weight: 1}}}},
-			},
-		},
-	}, nil)
-	wantJSON := `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:test-cluster-1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"test-cluster-1"}}]
-        }
-      }
-    }}]}`
-	wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantJSON)
-
-	gotState, err := tcc.stateCh.Receive(ctx)
+	// Read the update pushed by the resolver to the ClientConn.
+	val, err := tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
-	rState := gotState.(resolver.State)
+	rState := val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
+	wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`
+{
+	"loadBalancingConfig": [
+		{
+		  "xds_cluster_manager_experimental": {
+			"children": {
+			  "cluster:test-cluster-1": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "test-cluster-1"
+					}
+				  }
+				]
+			  }
+			}
+		  }
+		}
+	  ]
+}`)
 	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Error("want: ", cmp.Diff(nil, wantSCParsed.Config))
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 
 	// "Make an RPC" by invoking the config selector.
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatalf("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
 
-	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err != nil {
-		t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
 
 	// "Finish the RPC"; this could cause a panic if the resolver doesn't
 	// handle it correctly.
 	res.OnCommitted()
 
-	// Delete the resource.  The channel should receive a service config with the
-	// original cluster but with an erroring config selector.
-	suErr := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "resource removed error")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr)
-
-	if gotState, err = tcc.stateCh.Receive(ctx); err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+	// Delete the resources on the management server, resulting in a
+	// resource-not-found error from the xDS client.
+	if err := mgmtServer.Update(ctx, e2e.UpdateOptions{NodeID: nodeID}); err != nil {
+		t.Fatal(err)
 	}
-	rState = gotState.(resolver.State)
+
+	// The channel should receive the existing service config with the original
+	// cluster but with an erroring config selector.
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState = val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
 	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Error("want: ", cmp.Diff(nil, wantSCParsed.Config))
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 
 	// "Make another RPC" by invoking the config selector.
 	cs = iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatalf("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
 
-	res, err = cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+	res, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err == nil || status.Code(err) != codes.Unavailable {
-		t.Fatalf("Expected UNAVAILABLE error from cs.SelectConfig(_); got %v, %v", res, err)
+		t.Fatalf("cs.SelectConfig() got %v, %v, expected UNAVAILABLE error", res, err)
 	}
 
 	// In the meantime, an empty ServiceConfig update should have been sent.
-	if gotState, err = tcc.stateCh.Receive(ctx); err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
-	rState = gotState.(resolver.State)
+	rState = val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
 	wantSCParsed = internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)("{}")
 	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Error("want: ", cmp.Diff(nil, wantSCParsed.Config))
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 }
 
-func (s) TestXDSResolverWRR(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-
+// TestResolverWRR tests the case where the route configuration returned by the
+// management server contains a set of weighted clusters. The test performs a
+// bunch of RPCs using the cluster specifier returned by the resolver, and
+// verifies the cluster distribution.
+func (s) TestResolverWRR(t *testing.T) {
 	defer func(oldNewWRR func() wrr.WRR) { newWRR = oldNewWRR }(newWRR)
 	newWRR = testutils.NewTestWRR
 
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{
-					"A": {Weight: 5},
-					"B": {Weight: 10},
-				}}},
-			},
-		},
-	}, nil)
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	// Configure the management server with a good listener resource and a
+	// route configuration resource.
+	resources := e2e.UpdateOptions{
+		NodeID:    nodeID,
+		Listeners: []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes: []*v3routepb.RouteConfiguration{e2e.RouteConfigResourceWithOptions(e2e.RouteConfigOptions{
+			RouteConfigName:      rdsName,
+			ListenerName:         ldsName,
+			ClusterSpecifierType: e2e.RouteConfigClusterSpecifierTypeWeightedCluster,
+			WeightedClusters:     map[string]int{"A": 75, "B": 25},
+		})},
+		SkipValidation: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the update pushed by the resolver to the ClientConn.
 	gotState, err := tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
 	rState := gotState.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
-
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatal("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
 
+	// Make RPCs are verify WRR behavior in the cluster specifier.
 	picks := map[string]int{}
-	for i := 0; i < 30; i++ {
-		res, err := cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+	for i := 0; i < 100; i++ {
+		res, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 		if err != nil {
-			t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+			t.Fatalf("cs.SelectConfig(): %v", err)
 		}
 		picks[clustermanager.GetPickedClusterForTesting(res.Context)]++
 		res.OnCommitted()
 	}
-	want := map[string]int{"cluster:A": 10, "cluster:B": 20}
-	if !reflect.DeepEqual(picks, want) {
-		t.Errorf("picked clusters = %v; want %v", picks, want)
+	want := map[string]int{"cluster:A": 75, "cluster:B": 25}
+	if !cmp.Equal(picks, want) {
+		t.Errorf("Picked clusters: %v; want: %v", picks, want)
 	}
 }
 
-func (s) TestXDSResolverMaxStreamDuration(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
+// TestResolverMaxStreamDuration tests the case where the resolver receives max
+// stream duration as part of the listener and route configuration resources.
+// The test verifies that the RPC timeout returned by the config selector
+// matches expectations. A non-nil max stream duration (this includes an
+// explicit zero value) in a matching route overrides the value specified in the
+// listener resource.
+func (s) TestResolverMaxStreamDuration(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	// Configure the management server with a listener resource that specifies a
+	// max stream duration as part of its HTTP connection manager. Also
+	// configure a route configuration resource, which has multiple routes with
+	// different values of max stream duration.
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	hcm := testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+		RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{Rds: &v3httppb.Rds{
+			ConfigSource: &v3corepb.ConfigSource{
+				ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
+			},
+			RouteConfigName: rdsName,
+		}},
+		HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+		CommonHttpProtocolOptions: &v3corepb.HttpProtocolOptions{
+			MaxStreamDuration: durationpb.New(1 * time.Second),
+		},
+	})
+	resources := e2e.UpdateOptions{
+		NodeID: nodeID,
+		Listeners: []*v3listenerpb.Listener{{
+			Name:        ldsName,
+			ApiListener: &v3listenerpb.ApiListener{ApiListener: hcm},
+			FilterChains: []*v3listenerpb.FilterChain{{
+				Name: "filter-chain-name",
+				Filters: []*v3listenerpb.Filter{{
+					Name:       wellknown.HTTPConnectionManager,
+					ConfigType: &v3listenerpb.Filter_TypedConfig{TypedConfig: hcm},
+				}},
+			}},
+		}},
+		Routes: []*v3routepb.RouteConfiguration{{
+			Name: rdsName,
+			VirtualHosts: []*v3routepb.VirtualHost{{
+				Domains: []string{ldsName},
+				Routes: []*v3routepb.Route{
+					{
+						Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/foo"}},
+						Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+							ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+								Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+									{
+										Name:   "A",
+										Weight: &wrapperspb.UInt32Value{Value: 100},
+									},
+								}},
+							},
+							MaxStreamDuration: &v3routepb.RouteAction_MaxStreamDuration{
+								MaxStreamDuration: durationpb.New(5 * time.Second),
+							},
+						}},
+					},
+					{
+						Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/bar"}},
+						Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+							ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+								Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+									{
+										Name:   "B",
+										Weight: &wrapperspb.UInt32Value{Value: 100},
+									},
+								}},
+							},
+							MaxStreamDuration: &v3routepb.RouteAction_MaxStreamDuration{
+								MaxStreamDuration: durationpb.New(0 * time.Second),
+							},
+						}},
+					},
+					{
+						Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+						Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+							ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+								Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+									{
+										Name:   "C",
+										Weight: &wrapperspb.UInt32Value{Value: 100},
+									},
+								}},
+							},
+						}},
+					},
+				},
+			}},
+		}},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, MaxStreamDuration: time.Second, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	defer func(oldNewWRR func() wrr.WRR) { newWRR = oldNewWRR }(newWRR)
-	newWRR = testutils.NewTestWRR
-
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes: []*xdsresource.Route{{
-					Prefix:            newStringP("/foo"),
-					WeightedClusters:  map[string]xdsresource.WeightedCluster{"A": {Weight: 1}},
-					MaxStreamDuration: newDurationP(5 * time.Second),
-				}, {
-					Prefix:            newStringP("/bar"),
-					WeightedClusters:  map[string]xdsresource.WeightedCluster{"B": {Weight: 1}},
-					MaxStreamDuration: newDurationP(0),
-				}, {
-					Prefix:           newStringP(""),
-					WeightedClusters: map[string]xdsresource.WeightedCluster{"C": {Weight: 1}},
-				}},
-			},
-		},
-	}, nil)
-
+	// Read the update pushed by the resolver to the ClientConn.
 	gotState, err := tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
 	rState := gotState.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
-
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatal("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
 
 	testCases := []struct {
@@ -935,293 +1437,308 @@ func (s) TestXDSResolverMaxStreamDuration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := iresolver.RPCInfo{
 				Method:  tc.method,
-				Context: context.Background(),
+				Context: ctx,
 			}
 			res, err := cs.SelectConfig(req)
 			if err != nil {
-				t.Errorf("Unexpected error from cs.SelectConfig(%v): %v", req, err)
+				t.Errorf("cs.SelectConfig(%v): %v", req, err)
 				return
 			}
 			res.OnCommitted()
 			got := res.MethodConfig.Timeout
-			if !reflect.DeepEqual(got, tc.want) {
+			if !cmp.Equal(got, tc.want) {
 				t.Errorf("For method %q: res.MethodConfig.Timeout = %v; want %v", tc.method, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestXDSResolverDelayedOnCommitted tests that clusters remain in service
+// TestResolverDelayedOnCommitted tests that clusters remain in service
 // config if RPCs are in flight.
-func (s) TestXDSResolverDelayedOnCommitted(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
+func (s) TestResolverDelayedOnCommitted(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgmtServer.Stop()
 
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
+
+	// Configure the management server with a good listener and route
+	// configuration resource.
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, ldsName, "old-cluster")},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"test-cluster-1": {Weight: 1}}}},
-			},
-		},
-	}, nil)
-
-	gotState, err := tcc.stateCh.Receive(ctx)
+	// Read the update pushed by the resolver to the ClientConn.
+	val, err := tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
-	rState := gotState.(resolver.State)
+	rState := val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
-
-	wantJSON := `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:test-cluster-1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"test-cluster-1"}}]
-        }
-      }
-    }}]}`
-	wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantJSON)
+	wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`
+{
+	"loadBalancingConfig": [
+		{
+		  "xds_cluster_manager_experimental": {
+			"children": {
+			  "cluster:old-cluster": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "old-cluster"
+					} 
+				  } 
+				] 
+			  } 
+			} 
+		  } 
+		} 
+	  ] 
+}`)
 	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Fatal("want: ", cmp.Diff(nil, wantSCParsed.Config))
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 
+	// Make an RPC, but do not commit it yet.
 	cs := iresolver.GetConfigSelector(rState)
 	if cs == nil {
-		t.Fatal("received nil config selector")
+		t.Fatal("Received nil config selector in update from resolver")
 	}
-
-	res, err := cs.SelectConfig(iresolver.RPCInfo{Context: context.Background()})
+	resOld, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err != nil {
-		t.Fatalf("Unexpected error from cs.SelectConfig(_): %v", err)
+		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
-	cluster := clustermanager.GetPickedClusterForTesting(res.Context)
-	if cluster != "cluster:test-cluster-1" {
-		t.Fatalf("")
+	if cluster := clustermanager.GetPickedClusterForTesting(resOld.Context); cluster != "cluster:old-cluster" {
+		t.Fatalf("Picked cluster is %q, want %q", cluster, "cluster:old-cluster")
 	}
-	// delay res.OnCommitted()
 
-	// Perform TWO updates to ensure the old config selector does not hold a
-	// reference to test-cluster-1.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"NEW": {Weight: 1}}}},
-			},
-		},
-	}, nil)
-	tcc.stateCh.Receive(ctx) // Ignore the first update.
+	// Delay resOld.OnCommitted(). As long as there are pending RPCs to removed
+	// clusters, they still appear in the service config.
 
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"NEW": {Weight: 1}}}},
-			},
-		},
-	}, nil)
+	// Update the route configuration resource on the management server to
+	// return a new cluster.
+	resources = e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		Routes:         []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(rdsName, ldsName, "new-cluster")},
+		SkipValidation: true,
+	}
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	gotState, err = tcc.stateCh.Receive(ctx)
+	// Read the update pushed by the resolver to the ClientConn and ensure the
+	// old cluster is present in the service config. Also ensure that the newly
+	// returned config selector does not hold a reference to the old cluster.
+	val, err = tcc.stateCh.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
 	}
-	rState = gotState.(resolver.State)
+	rState = val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
-	wantJSON2 := `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:test-cluster-1":{
-          "childPolicy":[{"cds_experimental":{"cluster":"test-cluster-1"}}]
-        },
-        "cluster:NEW":{
-          "childPolicy":[{"cds_experimental":{"cluster":"NEW"}}]
-        }
-      }
-    }}]}`
-	wantSCParsed2 := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantJSON2)
-	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed2.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Fatal("want: ", cmp.Diff(nil, wantSCParsed2.Config))
+	wantSCParsed = internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`
+{
+	"loadBalancingConfig": [
+		{
+		  "xds_cluster_manager_experimental": {
+			"children": {
+			  "cluster:old-cluster": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "old-cluster"
+					} 
+				  } 
+				] 
+			  }, 
+			  "cluster:new-cluster": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "new-cluster"
+					} 
+				  } 
+				] 
+			  } 
+			} 
+		  } 
+		} 
+	  ] 
+}`)
+	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
+		t.Fatalf("Got service config:\n%s\nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 
-	// Invoke OnCommitted; should lead to a service config update that deletes
-	// test-cluster-1.
-	res.OnCommitted()
-
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{"NEW": {Weight: 1}}}},
-			},
-		},
-	}, nil)
-	gotState, err = tcc.stateCh.Receive(ctx)
+	cs = iresolver.GetConfigSelector(rState)
+	if cs == nil {
+		t.Fatal("Received nil config selector in update from resolver")
+	}
+	resNew, err := cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatalf("cs.SelectConfig(): %v", err)
 	}
-	rState = gotState.(resolver.State)
+	if cluster := clustermanager.GetPickedClusterForTesting(resNew.Context); cluster != "cluster:new-cluster" {
+		t.Fatalf("Picked cluster is %q, want %q", cluster, "cluster:new-cluster")
+	}
+
+	// Invoke OnCommitted on the old RPC; should lead to a service config update
+	// that deletes the old cluster, as the old cluster no longer has any
+	// pending RPCs.
+	resOld.OnCommitted()
+
+	val, err = tcc.stateCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Timeout waiting for an update from the resolver: %v", err)
+	}
+	rState = val.(resolver.State)
 	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
+		t.Fatalf("Received error in service config: %v", rState.ServiceConfig.Err)
 	}
-	wantJSON3 := `{"loadBalancingConfig":[{
-    "xds_cluster_manager_experimental":{
-      "children":{
-        "cluster:NEW":{
-          "childPolicy":[{"cds_experimental":{"cluster":"NEW"}}]
-        }
-      }
-    }}]}`
-	wantSCParsed3 := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantJSON3)
-	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed3.Config) {
-		t.Errorf("ClientConn.UpdateState received different service config")
-		t.Error("got: ", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Fatal("want: ", cmp.Diff(nil, wantSCParsed3.Config))
+	wantSCParsed = internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(`
+{
+	"loadBalancingConfig": [
+		{
+		  "xds_cluster_manager_experimental": {
+			"children": {
+			  "cluster:new-cluster": {
+				"childPolicy": [
+				  {
+					"cds_experimental": {
+					  "cluster": "new-cluster"
+					} 
+				  } 
+				] 
+			  } 
+			} 
+		  } 
+		} 
+	  ] 
+}`)
+	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantSCParsed.Config) {
+		t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, rState.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
 	}
 }
 
-// TestXDSResolverUpdates tests the cases where the resolver gets a good update
-// after an error, and an error after the good update.
-func (s) TestXDSResolverGoodUpdateAfterError(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-
-	// Invoke the watchAPI callback with a bad service update and wait for the
-	// ReportError method to be called on the ClientConn.
-	suErr := errors.New("bad serviceupdate")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr)
-
-	if gotErrVal, gotErr := tcc.errorCh.Receive(ctx); gotErr != nil || gotErrVal != suErr {
-		t.Fatalf("ClientConn.ReportError() received %v, want %v", gotErrVal, suErr)
-	}
-
-	// Invoke the watchAPI callback with a good service update and wait for the
-	// UpdateState method to be called on the ClientConn.
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
-		VirtualHosts: []*xdsresource.VirtualHost{
-			{
-				Domains: []string{targetStr},
-				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
-			},
-		},
-	}, nil)
-	gotState, err := tcc.stateCh.Receive(ctx)
+// TestResolverMultipleLDSUpdates tests the case where two LDS updates with the
+// same RDS name to watch are received without an RDS in between. Those LDS
+// updates shouldn't trigger a service config update.
+func (s) TestResolverMultipleLDSUpdates(t *testing.T) {
+	mgmtServer, err := e2e.StartManagementServer(e2e.ManagementServerOptions{})
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatal(err)
 	}
-	rState := gotState.(resolver.State)
-	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
-	}
+	defer mgmtServer.Stop()
 
-	// Invoke the watchAPI callback with a bad service update and wait for the
-	// ReportError method to be called on the ClientConn.
-	suErr2 := errors.New("bad serviceupdate 2")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr2)
-	if gotErrVal, gotErr := tcc.errorCh.Receive(ctx); gotErr != nil || gotErrVal != suErr2 {
-		t.Fatalf("ClientConn.ReportError() received %v, want %v", gotErrVal, suErr2)
-	}
-}
-
-// TestXDSResolverResourceNotFoundError tests the cases where the resolver gets
-// a ResourceNotFoundError. It should generate a service config picking
-// weighted_target, but no child balancers.
-func (s) TestXDSResolverResourceNotFoundError(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-
-	// Invoke the watchAPI callback with a bad service update and wait for the
-	// ReportError method to be called on the ClientConn.
-	suErr := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "resource removed error")
-	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{}, suErr)
-
-	if gotErrVal, gotErr := tcc.errorCh.Receive(ctx); gotErr != context.DeadlineExceeded {
-		t.Fatalf("ClientConn.ReportError() received %v, %v, want channel recv timeout", gotErrVal, gotErr)
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	gotState, err := tcc.stateCh.Receive(ctx)
+	// Create a bootstrap configuration specifying the above management server.
+	nodeID := uuid.New().String()
+	cleanup, err := xdsbootstrap.CreateFile(xdsbootstrap.Options{
+		NodeID:    nodeID,
+		ServerURI: mgmtServer.Address,
+	})
 	if err != nil {
-		t.Fatalf("Error waiting for UpdateState to be called: %v", err)
+		t.Fatal(err)
 	}
-	rState := gotState.(resolver.State)
-	wantParsedConfig := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)("{}")
-	if !internal.EqualServiceConfigForTesting(rState.ServiceConfig.Config, wantParsedConfig.Config) {
-		t.Error("ClientConn.UpdateState got wrong service config")
-		t.Errorf("gotParsed: %s", cmp.Diff(nil, rState.ServiceConfig.Config))
-		t.Errorf("wantParsed: %s", cmp.Diff(nil, wantParsedConfig.Config))
-	}
-	if err := rState.ServiceConfig.Err; err != nil {
-		t.Fatalf("ClientConn.UpdateState received error in service config: %v", rState.ServiceConfig.Err)
-	}
-}
+	defer cleanup()
 
-// TestXDSResolverMultipleLDSUpdates tests the case where two LDS updates with
-// the same RDS name to watch are received without an RDS in between. Those LDS
-// updates shouldn't trigger service config update.
-//
-// This test case also makes sure the resolver doesn't panic.
-func (s) TestXDSResolverMultipleLDSUpdates(t *testing.T) {
-	xdsR, xdsC, tcc, cancel := testSetup(t, setupOpts{target: target})
-	defer xdsR.Close()
-	defer cancel()
+	// Build an xDS resolver that uses the above bootstrap configuration
+	// Creating the xDS resolver should result in creation of the xDS client.
+	const serviceName = "my-service-client-side-xds"
+	tcc, rClose := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + serviceName)})
+	defer rClose()
 
+	// Configure the management server with a listener resource, but no route
+	// configuration resource.
+	ldsName := serviceName
+	rdsName := "route-" + serviceName
+	resources := e2e.UpdateOptions{
+		NodeID:         nodeID,
+		Listeners:      []*v3listenerpb.Listener{e2e.DefaultClientListener(ldsName, rdsName)},
+		SkipValidation: true,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
-	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-	defer replaceRandNumGenerator(0)()
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
 
-	// Send a new LDS update, with the same fields.
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, HTTPFilters: routerFilterList}, nil)
-	ctx, cancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer cancel()
-	// Should NOT trigger a state update.
-	gotState, err := tcc.stateCh.Receive(ctx)
+	// Ensure there is no update from the resolver.
+	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	gotState, err := tcc.stateCh.Receive(sCtx)
 	if err == nil {
-		t.Fatalf("ClientConn.UpdateState received %v, want timeout error", gotState)
+		t.Fatalf("Received update from resolver %v when none expected", gotState)
 	}
 
-	// Send a new LDS update, with the same RDS name, but different fields.
-	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, MaxStreamDuration: time.Second, HTTPFilters: routerFilterList}, nil)
-	ctx, cancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer cancel()
-	gotState, err = tcc.stateCh.Receive(ctx)
+	// Configure the management server with a listener resource that points to
+	// the same route configuration resource but has different values for some
+	// other fields. There is still no route configuration resource on the
+	// management server.
+	hcm := testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+		RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{Rds: &v3httppb.Rds{
+			ConfigSource: &v3corepb.ConfigSource{
+				ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
+			},
+			RouteConfigName: rdsName,
+		}},
+		HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+		CommonHttpProtocolOptions: &v3corepb.HttpProtocolOptions{
+			MaxStreamDuration: durationpb.New(1 * time.Second),
+		},
+	})
+	resources = e2e.UpdateOptions{
+		NodeID: nodeID,
+		Listeners: []*v3listenerpb.Listener{{
+			Name:        ldsName,
+			ApiListener: &v3listenerpb.ApiListener{ApiListener: hcm},
+			FilterChains: []*v3listenerpb.FilterChain{{
+				Name: "filter-chain-name",
+				Filters: []*v3listenerpb.Filter{{
+					Name:       wellknown.HTTPConnectionManager,
+					ConfigType: &v3listenerpb.Filter_TypedConfig{TypedConfig: hcm},
+				}},
+			}},
+		}},
+		SkipValidation: true,
+	}
+	if err := mgmtServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure that there is no update from the resolver.
+	sCtx, sCancel = context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	gotState, err = tcc.stateCh.Receive(sCtx)
 	if err == nil {
-		t.Fatalf("ClientConn.UpdateState received %v, want timeout error", gotState)
+		t.Fatalf("Received update from resolver %v when none expected", gotState)
 	}
 }
 
@@ -1480,18 +1997,6 @@ func (s) TestXDSResolverHTTPFilters(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func replaceRandNumGenerator(start int64) func() {
-	nextInt := start
-	xdsresource.RandInt63n = func(int64) (ret int64) {
-		ret = nextInt
-		nextInt++
-		return
-	}
-	return func() {
-		xdsresource.RandInt63n = grpcrand.Int63n
 	}
 }
 

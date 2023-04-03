@@ -37,6 +37,7 @@ import (
 	"google.golang.org/grpc/xds"
 
 	xdscreds "google.golang.org/grpc/credentials/xds"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 	testpb "google.golang.org/grpc/interop/grpc_testing"
@@ -117,15 +118,16 @@ func main() {
 	// If -secure_mode is not set, expose all services on -port with a regular
 	// gRPC server.
 	if !*secureMode {
-		lis, err := net.Listen("tcp4", fmt.Sprintf(":%d", *port))
+		addr := fmt.Sprintf(":%d", *port)
+		lis, err := net.Listen("tcp4", addr)
 		if err != nil {
-			logger.Fatalf("net.Listen(%s) failed: %v", fmt.Sprintf(":%d", *port), err)
+			logger.Fatalf("net.Listen(%s) failed: %v", addr, err)
 		}
 
 		server := grpc.NewServer()
 		testgrpc.RegisterTestServiceServer(server, testService)
 		healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-		healthpb.RegisterHealthServer(server, healthServer)
+		healthgrpc.RegisterHealthServer(server, healthServer)
 		testgrpc.RegisterXdsUpdateHealthServiceServer(server, updateHealthService)
 		reflection.Register(server)
 		cleanup, err := admin.Register(server)
@@ -140,9 +142,10 @@ func main() {
 	}
 
 	// Create a listener on -port to expose the test service.
-	testLis, err := net.Listen("tcp4", fmt.Sprintf(":%d", *port))
+	addr := fmt.Sprintf(":%d", *port)
+	testLis, err := net.Listen("tcp4", addr)
 	if err != nil {
-		logger.Fatalf("net.Listen(%s) failed: %v", fmt.Sprintf(":%d", *port), err)
+		logger.Fatalf("net.Listen(%s) failed: %v", addr, err)
 	}
 
 	// Create server-side xDS credentials with a plaintext fallback.
@@ -163,16 +166,17 @@ func main() {
 	defer testServer.Stop()
 
 	// Create a listener on -maintenance_port to expose other services.
-	maintenanceLis, err := net.Listen("tcp4", fmt.Sprintf(":%d", *maintenancePort))
+	addr = fmt.Sprintf(":%d", *maintenancePort)
+	maintenanceLis, err := net.Listen("tcp4", addr)
 	if err != nil {
-		logger.Fatalf("net.Listen(%s) failed: %v", fmt.Sprintf(":%d", *maintenancePort), err)
+		logger.Fatalf("net.Listen(%s) failed: %v", addr, err)
 	}
 
 	// Create a regular gRPC server and register the maintenance services on
 	// it and start serving.
 	maintenanceServer := grpc.NewServer()
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-	healthpb.RegisterHealthServer(maintenanceServer, healthServer)
+	healthgrpc.RegisterHealthServer(maintenanceServer, healthServer)
 	testgrpc.RegisterXdsUpdateHealthServiceServer(maintenanceServer, updateHealthService)
 	reflection.Register(maintenanceServer)
 	cleanup, err := admin.Register(maintenanceServer)

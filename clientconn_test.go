@@ -25,17 +25,20 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	internalbackoff "google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/grpcsync"
+	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
@@ -43,6 +46,17 @@ import (
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/testdata"
 )
+
+const (
+	defaultTestTimeout         = 10 * time.Second
+	stateRecordingBalancerName = "state_recording_balancer"
+)
+
+var testBalancerBuilder = newStateRecordingBalancerBuilder()
+
+func init() {
+	balancer.Register(testBalancerBuilder)
+}
 
 func parseCfg(r *manual.Resolver, s string) *serviceconfig.ParseResult {
 	scpr := r.CC.ParseServiceConfig(s)
@@ -221,8 +235,10 @@ func (s) TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 		lis.Addr().String(),
 		WithTransportCredentials(insecure.NewCredentials()),
 		WithReturnConnectionError(),
-		withBackoff(noBackoff{}),
-		withMinConnectDeadline(func() time.Duration { return time.Second / 4 }))
+		WithConnectParams(ConnectParams{
+			Backoff:           backoff.Config{},
+			MinConnectTimeout: 250 * time.Millisecond,
+		}))
 	lis.Close()
 	if err == nil {
 		client.Close()
@@ -320,7 +336,7 @@ func (s) TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 func (s) TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		t.Fatalf("Error while listening. Err: %v", err)
+		t.Fatalf("Unexpected error from net.Listen(%q, %q): %v", "tcp", "localhost:0", err)
 	}
 	defer lis.Close()
 	done := make(chan struct{})
@@ -352,9 +368,19 @@ func (s) TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 			prevAt = meow
 		}
 	}()
-	cc, err := Dial(lis.Addr().String(), WithTransportCredentials(insecure.NewCredentials()))
+	bc := backoff.Config{
+		BaseDelay:  200 * time.Millisecond,
+		Multiplier: 1.1,
+		Jitter:     0,
+		MaxDelay:   120 * time.Second,
+	}
+	cp := ConnectParams{
+		Backoff:           bc,
+		MinConnectTimeout: 1 * time.Second,
+	}
+	cc, err := Dial(lis.Addr().String(), WithTransportCredentials(insecure.NewCredentials()), WithConnectParams(cp))
 	if err != nil {
-		t.Fatalf("Error while dialing. Err: %v", err)
+		t.Fatalf("Unexpected error from Dial(%v) = %v", lis.Addr(), err)
 	}
 	defer cc.Close()
 	go stayConnected(cc)
@@ -453,7 +479,6 @@ func (s) TestDial_OneBackoffPerRetryGroup(t *testing.T) {
 	}})
 	client, err := DialContext(ctx, "whatever:///this-gets-overwritten",
 		WithTransportCredentials(insecure.NewCredentials()),
-		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)),
 		WithResolvers(rb),
 		withMinConnectDeadline(getMinConnectTimeout))
 	if err != nil {
@@ -667,6 +692,8 @@ func (s) TestResolverEmptyUpdateNotPanic(t *testing.T) {
 }
 
 func (s) TestClientUpdatesParamsAfterGoAway(t *testing.T) {
+	grpctest.TLogger.ExpectError("Client received GoAway with error code ENHANCE_YOUR_CALM and debug data equal to ASCII \"too_many_pings\"")
+
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Failed to listen. Err: %v", err)
@@ -976,9 +1003,11 @@ func (s) TestUpdateAddresses_NoopIfCalledWithSameAddresses(t *testing.T) {
 	client, err := Dial("whatever:///this-gets-overwritten",
 		WithTransportCredentials(insecure.NewCredentials()),
 		WithResolvers(rb),
-		withBackoff(noBackoff{}),
-		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)),
-		withMinConnectDeadline(func() time.Duration { return time.Hour }))
+		WithConnectParams(ConnectParams{
+			Backoff:           backoff.Config{},
+			MinConnectTimeout: time.Hour,
+		}),
+		WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, stateRecordingBalancerName)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,10 +1142,70 @@ func testDefaultServiceConfigWhenResolverReturnInvalidServiceConfig(t *testing.T
 	}
 }
 
+type stateRecordingBalancer struct {
+	notifier chan<- connectivity.State
+	balancer.Balancer
+}
+
+func (b *stateRecordingBalancer) UpdateSubConnState(sc balancer.SubConn, s balancer.SubConnState) {
+	b.notifier <- s.ConnectivityState
+	b.Balancer.UpdateSubConnState(sc, s)
+}
+
+func (b *stateRecordingBalancer) ResetNotifier(r chan<- connectivity.State) {
+	b.notifier = r
+}
+
+func (b *stateRecordingBalancer) Close() {
+	b.Balancer.Close()
+}
+
+type stateRecordingBalancerBuilder struct {
+	mu       sync.Mutex
+	notifier chan connectivity.State // The notifier used in the last Balancer.
+}
+
+func newStateRecordingBalancerBuilder() *stateRecordingBalancerBuilder {
+	return &stateRecordingBalancerBuilder{}
+}
+
+func (b *stateRecordingBalancerBuilder) Name() string {
+	return stateRecordingBalancerName
+}
+
+func (b *stateRecordingBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+	stateNotifications := make(chan connectivity.State, 10)
+	b.mu.Lock()
+	b.notifier = stateNotifications
+	b.mu.Unlock()
+	return &stateRecordingBalancer{
+		notifier: stateNotifications,
+		Balancer: balancer.Get("pick_first").Build(cc, opts),
+	}
+}
+
+func (b *stateRecordingBalancerBuilder) nextStateNotifier() <-chan connectivity.State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ret := b.notifier
+	b.notifier = nil
+	return ret
+}
+
+// Keep reading until something causes the connection to die (EOF, server
+// closed, etc). Useful as a tool for mindlessly keeping the connection
+// healthy, since the client will error if things like client prefaces are not
+// accepted in a timely fashion.
+func keepReading(conn net.Conn) {
+	buf := make([]byte, 1024)
+	for _, err := conn.Read(buf); err == nil; _, err = conn.Read(buf) {
+	}
+}
+
 // stayConnected makes cc stay connected by repeatedly calling cc.Connect()
 // until the state becomes Shutdown or until 10 seconds elapses.
 func stayConnected(cc *ClientConn) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
 	for {

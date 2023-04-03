@@ -110,6 +110,11 @@ type SubConn interface {
 	UpdateAddresses([]resolver.Address)
 	// Connect starts the connecting for this SubConn.
 	Connect()
+	// GetOrBuildProducer returns a reference to the existing Producer for this
+	// ProducerBuilder in this SubConn, or, if one does not currently exist,
+	// creates a new one and returns it.  Returns a close function which must
+	// be called when the Producer is no longer needed.
+	GetOrBuildProducer(ProducerBuilder) (p Producer, close func())
 }
 
 // NewSubConnOptions contains options to create new SubConn.
@@ -252,7 +257,7 @@ type DoneInfo struct {
 	// ServerLoad is the load received from server. It's usually sent as part of
 	// trailing metadata.
 	//
-	// The only supported type now is *orca_v1.LoadReport.
+	// The only supported type now is *orca_v3.LoadReport.
 	ServerLoad interface{}
 }
 
@@ -282,6 +287,14 @@ type PickResult struct {
 	// type, Done may not be called.  May be nil if the balancer does not wish
 	// to be notified when the RPC completes.
 	Done func(DoneInfo)
+
+	// Metadata provides a way for LB policies to inject arbitrary per-call
+	// metadata. Any metadata returned here will be merged with existing
+	// metadata added by the client application.
+	//
+	// LB policies with child policies are responsible for propagating metadata
+	// injected by their children to the ClientConn, as part of Pick().
+	Metatada metadata.MD
 }
 
 // TransientFailureError returns e.  It exists for backward compatibility and
@@ -392,17 +405,19 @@ type ClientConnState struct {
 // problem with the provided name resolver data.
 var ErrBadResolverState = errors.New("bad resolver state")
 
-// ConnectivityStateEvaluator takes the connectivity states of multiple SubConns
-// and returns one aggregated connectivity state.
-//
-// It's not thread safe.
-type ConnectivityStateEvaluator struct {
-	numReady            uint64 // Number of addrConns in ready state.
-	numConnecting       uint64 // Number of addrConns in connecting state.
-	numTransientFailure uint64 // Number of addrConns in transient failure state.
-	numIdle             uint64 // Number of addrConns in idle state.
+// A ProducerBuilder is a simple constructor for a Producer.  It is used by the
+// SubConn to create producers when needed.
+type ProducerBuilder interface {
+	// Build creates a Producer.  The first parameter is always a
+	// grpc.ClientConnInterface (a type to allow creating RPCs/streams on the
+	// associated SubConn), but is declared as interface{} to avoid a
+	// dependency cycle.  Should also return a close function that will be
+	// called when all references to the Producer have been given up.
+	Build(grpcClientConnInterface interface{}) (p Producer, close func())
 }
 
+/*
+<<<<<<< HEAD
 // RecordTransition 记录SubConn的状态变更，并且基于此评估聚合状态应该是什么
 // - 如果至少一个SubConn是Ready，聚合状态是Ready (感觉和代码逻辑不太一样，至少有一个是Ready则Ready，如果两个都是Ready，那么应该就是Ready。但是代码两个都是Ready的话，-1 和 1相抵，和为0，返回connectivity.TransientFailure)
 // - Else if 至少一个SubConn是Connecting，聚合状态是Connecting (由于是Else if，所以前提是没有SubConn是Ready)
@@ -452,4 +467,11 @@ func (cse *ConnectivityStateEvaluator) RecordTransition(oldState, newState conne
 		return connectivity.Idle
 	}
 	return connectivity.TransientFailure
+=======
+*/
+// A Producer is a type shared among potentially many consumers.  It is
+// associated with a SubConn, and an implementation will typically contain
+// other methods to provide additional functionality, e.g. configuration or
+// subscription registration.
+type Producer interface {
 }

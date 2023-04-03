@@ -59,7 +59,9 @@ var (
 	}
 	testLRSServerConfig = &bootstrap.ServerConfig{
 		ServerURI: "trafficdirector.googleapis.com:443",
-		CredsType: "google_default",
+		Creds: bootstrap.ChannelCreds{
+			Type: "google_default",
+		},
 	}
 
 	cmpOpts = cmp.Options{
@@ -76,13 +78,6 @@ func Test(t *testing.T) {
 	grpctest.RunSubTests(t, s{})
 }
 
-func subConnFromPicker(p balancer.Picker) func() balancer.SubConn {
-	return func() balancer.SubConn {
-		scst, _ := p.Pick(balancer.PickInfo{})
-		return scst.SubConn
-	}
-}
-
 func init() {
 	NewRandomWRR = testutils.NewTestWRR
 }
@@ -95,7 +90,6 @@ func (s) TestDropByCategory(t *testing.T) {
 
 	defer xdsclient.ClearCounterForTesting(testClusterName, testServiceName)
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -255,7 +249,6 @@ func (s) TestDropByCategory(t *testing.T) {
 func (s) TestDropCircuitBreaking(t *testing.T) {
 	defer xdsclient.ClearCounterForTesting(testClusterName, testServiceName)
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -368,7 +361,6 @@ func (s) TestDropCircuitBreaking(t *testing.T) {
 func (s) TestPickerUpdateAfterClose(t *testing.T) {
 	defer xdsclient.ClearCounterForTesting(testClusterName, testServiceName)
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -437,7 +429,6 @@ func (s) TestClusterNameInAddressAttributes(t *testing.T) {
 
 	defer xdsclient.ClearCounterForTesting(testClusterName, testServiceName)
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -513,7 +504,6 @@ func (s) TestReResolution(t *testing.T) {
 
 	defer xdsclient.ClearCounterForTesting(testClusterName, testServiceName)
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -581,7 +571,6 @@ func (s) TestLoadReporting(t *testing.T) {
 	}
 
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -696,7 +685,6 @@ func (s) TestUpdateLRSServer(t *testing.T) {
 	}
 
 	xdsC := fakeclient.NewClient()
-	defer xdsC.Close()
 
 	builder := balancer.Get(Name)
 	cc := testutils.NewTestClientConn(t)
@@ -734,7 +722,9 @@ func (s) TestUpdateLRSServer(t *testing.T) {
 
 	testLRSServerConfig2 := &bootstrap.ServerConfig{
 		ServerURI: "trafficdirector-another.googleapis.com:443",
-		CredsType: "google_default",
+		Creds: bootstrap.ChannelCreds{
+			Type: "google_default",
+		},
 	}
 	// Update LRS server to a different name.
 	if err := b.UpdateClientConnState(balancer.ClientConnState{

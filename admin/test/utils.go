@@ -26,16 +26,18 @@ import (
 	"testing"
 	"time"
 
-	v3statusgrpc "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
-	v3statuspb "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/admin"
-	channelzpb "google.golang.org/grpc/channelz/grpc_channelz_v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal/xds"
+	"google.golang.org/grpc/internal/testutils/xds/bootstrap"
 	"google.golang.org/grpc/status"
+
+	v3statusgrpc "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+	v3statuspb "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+	channelzgrpc "google.golang.org/grpc/channelz/grpc_channelz_v1"
+	channelzpb "google.golang.org/grpc/channelz/grpc_channelz_v1"
 )
 
 const (
@@ -53,8 +55,7 @@ type ExpectedStatusCodes struct {
 // codes.
 func RunRegisterTests(t *testing.T, ec ExpectedStatusCodes) {
 	nodeID := uuid.New().String()
-	bootstrapCleanup, err := xds.SetupBootstrapFile(xds.BootstrapOptions{
-		Version:   xds.TransportV3,
+	bootstrapCleanup, err := bootstrap.CreateFile(bootstrap.Options{
 		NodeID:    nodeID,
 		ServerURI: "no.need.for.a.server",
 	})
@@ -98,7 +99,7 @@ func RunRegisterTests(t *testing.T, ec ExpectedStatusCodes) {
 
 // RunChannelz makes a channelz RPC.
 func RunChannelz(conn *grpc.ClientConn) error {
-	c := channelzpb.NewChannelzClient(conn)
+	c := channelzgrpc.NewChannelzClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	_, err := c.GetTopChannels(ctx, &channelzpb.GetTopChannelsRequest{}, grpc.WaitForReady(true))

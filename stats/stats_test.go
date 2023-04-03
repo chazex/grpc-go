@@ -568,9 +568,9 @@ func checkInPayload(t *testing.T, d *gotData, e *expectedData) {
 	}
 	// Below are sanity checks that WireLength and RecvTime are populated.
 	// TODO: check values of WireLength and RecvTime.
-	if len(st.Data) > 0 && st.WireLength == 0 {
+	if len(st.Data) > 0 && st.CompressedLength == 0 {
 		t.Fatalf("st.WireLength = %v with non-empty data, want <non-zero>",
-			st.WireLength)
+			st.CompressedLength)
 	}
 	if st.RecvTime.IsZero() {
 		t.Fatalf("st.ReceivedTime = %v, want <non-zero>", st.RecvTime)
@@ -1393,7 +1393,7 @@ func (s) TestMultipleClientStatsHandler(t *testing.T) {
 
 	for start := time.Now(); time.Since(start) < defaultTestTimeout; {
 		h.mu.Lock()
-		if _, ok := h.gotRPC[len(h.gotRPC)-1].s.(*stats.End); ok {
+		if _, ok := h.gotRPC[len(h.gotRPC)-1].s.(*stats.End); ok && len(h.gotRPC) == 12 {
 			h.mu.Unlock()
 			break
 		}
@@ -1403,7 +1403,7 @@ func (s) TestMultipleClientStatsHandler(t *testing.T) {
 
 	for start := time.Now(); time.Since(start) < defaultTestTimeout; {
 		h.mu.Lock()
-		if _, ok := h.gotConn[len(h.gotConn)-1].s.(*stats.ConnEnd); ok {
+		if _, ok := h.gotConn[len(h.gotConn)-1].s.(*stats.ConnEnd); ok && len(h.gotConn) == 4 {
 			h.mu.Unlock()
 			break
 		}

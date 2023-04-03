@@ -19,6 +19,7 @@
 package grpc
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ import (
 	"google.golang.org/grpc/internal"
 )
 
-func (s) TestAddExtraDialOptions(t *testing.T) {
+func (s) TestAddGlobalDialOptions(t *testing.T) {
 	// Ensure the Dial fails without credentials
 	if _, err := Dial("fake"); err == nil {
 		t.Fatalf("Dialing without a credential did not fail")
@@ -38,10 +39,10 @@ func (s) TestAddExtraDialOptions(t *testing.T) {
 
 	// Set and check the DialOptions
 	opts := []DialOption{WithTransportCredentials(insecure.NewCredentials()), WithTransportCredentials(insecure.NewCredentials()), WithTransportCredentials(insecure.NewCredentials())}
-	internal.AddExtraDialOptions.(func(opt ...DialOption))(opts...)
+	internal.AddGlobalDialOptions.(func(opt ...DialOption))(opts...)
 	for i, opt := range opts {
-		if extraDialOptions[i] != opt {
-			t.Fatalf("Unexpected extra dial option at index %d: %v != %v", i, extraDialOptions[i], opt)
+		if globalDialOptions[i] != opt {
+			t.Fatalf("Unexpected global dial option at index %d: %v != %v", i, globalDialOptions[i], opt)
 		}
 	}
 
@@ -52,20 +53,35 @@ func (s) TestAddExtraDialOptions(t *testing.T) {
 		cc.Close()
 	}
 
-	internal.ClearExtraDialOptions()
-	if len(extraDialOptions) != 0 {
-		t.Fatalf("Unexpected len of extraDialOptions: %d != 0", len(extraDialOptions))
+	internal.ClearGlobalDialOptions()
+	if len(globalDialOptions) != 0 {
+		t.Fatalf("Unexpected len of globalDialOptions: %d != 0", len(globalDialOptions))
 	}
 }
 
-func (s) TestAddExtraServerOptions(t *testing.T) {
+// TestDisableGlobalOptions tests dialing with the disableGlobalDialOptions dial
+// option. Dialing with this set should not pick up global options.
+func (s) TestDisableGlobalOptions(t *testing.T) {
+	// Set transport credentials as a global option.
+	internal.AddGlobalDialOptions.(func(opt ...DialOption))(WithTransportCredentials(insecure.NewCredentials()))
+	// Dial with the disable global options dial option. This dial should fail
+	// due to the global dial options with credentials not being picked up due
+	// to global options being disabled.
+	noTSecStr := "no transport security set"
+	if _, err := Dial("fake", internal.DisableGlobalDialOptions.(func() DialOption)()); !strings.Contains(fmt.Sprint(err), noTSecStr) {
+		t.Fatalf("Dialing received unexpected error: %v, want error containing \"%v\"", err, noTSecStr)
+	}
+	internal.ClearGlobalDialOptions()
+}
+
+func (s) TestAddGlobalServerOptions(t *testing.T) {
 	const maxRecvSize = 998765
 	// Set and check the ServerOptions
-	opts := []ServerOption{StatsHandler(nil), Creds(insecure.NewCredentials()), MaxRecvMsgSize(maxRecvSize)}
-	internal.AddExtraServerOptions.(func(opt ...ServerOption))(opts...)
+	opts := []ServerOption{Creds(insecure.NewCredentials()), MaxRecvMsgSize(maxRecvSize)}
+	internal.AddGlobalServerOptions.(func(opt ...ServerOption))(opts...)
 	for i, opt := range opts {
-		if extraServerOptions[i] != opt {
-			t.Fatalf("Unexpected extra server option at index %d: %v != %v", i, extraServerOptions[i], opt)
+		if globalServerOptions[i] != opt {
+			t.Fatalf("Unexpected global server option at index %d: %v != %v", i, globalServerOptions[i], opt)
 		}
 	}
 
@@ -75,8 +91,44 @@ func (s) TestAddExtraServerOptions(t *testing.T) {
 		t.Fatalf("Unexpected s.opts.maxReceiveMessageSize: %d != %d", s.opts.maxReceiveMessageSize, maxRecvSize)
 	}
 
-	internal.ClearExtraServerOptions()
-	if len(extraServerOptions) != 0 {
-		t.Fatalf("Unexpected len of extraServerOptions: %d != 0", len(extraServerOptions))
+	internal.ClearGlobalServerOptions()
+	if len(globalServerOptions) != 0 {
+		t.Fatalf("Unexpected len of globalServerOptions: %d != 0", len(globalServerOptions))
+	}
+}
+
+// TestJoinDialOption tests the join dial option. It configures a joined dial
+// option with three individual dial options, and verifies that all three are
+// successfully applied.
+func (s) TestJoinDialOption(t *testing.T) {
+	const maxRecvSize = 998765
+	const initialWindowSize = 100
+	jdo := newJoinDialOption(WithTransportCredentials(insecure.NewCredentials()), WithReadBufferSize(maxRecvSize), WithInitialWindowSize(initialWindowSize))
+	cc, err := Dial("fake", jdo)
+	if err != nil {
+		t.Fatalf("Dialing with insecure credentials failed: %v", err)
+	}
+	defer cc.Close()
+	if cc.dopts.copts.ReadBufferSize != maxRecvSize {
+		t.Fatalf("Unexpected cc.dopts.copts.ReadBufferSize: %d != %d", cc.dopts.copts.ReadBufferSize, maxRecvSize)
+	}
+	if cc.dopts.copts.InitialWindowSize != initialWindowSize {
+		t.Fatalf("Unexpected cc.dopts.copts.InitialWindowSize: %d != %d", cc.dopts.copts.InitialWindowSize, initialWindowSize)
+	}
+}
+
+// TestJoinDialOption tests the join server option. It configures a joined
+// server option with three individual server options, and verifies that all
+// three are successfully applied.
+func (s) TestJoinServerOption(t *testing.T) {
+	const maxRecvSize = 998765
+	const initialWindowSize = 100
+	jso := newJoinServerOption(Creds(insecure.NewCredentials()), MaxRecvMsgSize(maxRecvSize), InitialWindowSize(initialWindowSize))
+	s := NewServer(jso)
+	if s.opts.maxReceiveMessageSize != maxRecvSize {
+		t.Fatalf("Unexpected s.opts.maxReceiveMessageSize: %d != %d", s.opts.maxReceiveMessageSize, maxRecvSize)
+	}
+	if s.opts.initialWindowSize != initialWindowSize {
+		t.Fatalf("Unexpected s.opts.initialWindowSize: %d != %d", s.opts.initialWindowSize, initialWindowSize)
 	}
 }

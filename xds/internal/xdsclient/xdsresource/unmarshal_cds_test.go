@@ -27,14 +27,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc/internal/envconfig"
+	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/xds/matcher"
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	v2xdspb "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	v2corepb "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	v3endpointpb "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
@@ -191,6 +190,38 @@ func (s) TestValidateCluster_Failure(t *testing.T) {
 						MaximumRingSize: wrapperspb.UInt64(ringHashSizeUpperBound + 1),
 					},
 				},
+			},
+			wantUpdate: emptyUpdate,
+			wantErr:    true,
+		},
+		{
+			name: "aggregate-nil-clusters",
+			cluster: &v3clusterpb.Cluster{
+				Name: clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_ClusterType{
+					ClusterType: &v3clusterpb.Cluster_CustomClusterType{
+						Name:        "envoy.clusters.aggregate",
+						TypedConfig: testutils.MarshalAny(&v3aggregateclusterpb.ClusterConfig{}),
+					},
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+			},
+			wantUpdate: emptyUpdate,
+			wantErr:    true,
+		},
+		{
+			name: "aggregate-empty-clusters",
+			cluster: &v3clusterpb.Cluster{
+				Name: clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_ClusterType{
+					ClusterType: &v3clusterpb.Cluster_CustomClusterType{
+						Name: "envoy.clusters.aggregate",
+						TypedConfig: testutils.MarshalAny(&v3aggregateclusterpb.ClusterConfig{
+							Clusters: []string{},
+						}),
+					},
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 			},
 			wantUpdate: emptyUpdate,
 			wantErr:    true,
@@ -1381,31 +1412,10 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 
 func (s) TestUnmarshalCluster(t *testing.T) {
 	const (
-		v2ClusterName = "v2clusterName"
 		v3ClusterName = "v3clusterName"
-		v2Service     = "v2Service"
-		v3Service     = "v2Service"
+		v3Service     = "v3Service"
 	)
 	var (
-		v2ClusterAny = testutils.MarshalAny(&v2xdspb.Cluster{
-			Name:                 v2ClusterName,
-			ClusterDiscoveryType: &v2xdspb.Cluster_Type{Type: v2xdspb.Cluster_EDS},
-			EdsClusterConfig: &v2xdspb.Cluster_EdsClusterConfig{
-				EdsConfig: &v2corepb.ConfigSource{
-					ConfigSourceSpecifier: &v2corepb.ConfigSource_Ads{
-						Ads: &v2corepb.AggregatedConfigSource{},
-					},
-				},
-				ServiceName: v2Service,
-			},
-			LbPolicy: v2xdspb.Cluster_ROUND_ROBIN,
-			LrsServer: &v2corepb.ConfigSource{
-				ConfigSourceSpecifier: &v2corepb.ConfigSource_Self{
-					Self: &v2corepb.SelfConfigSource{},
-				},
-			},
-		})
-
 		v3ClusterAny = testutils.MarshalAny(&v3clusterpb.Cluster{
 			Name:                 v3ClusterName,
 			ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
@@ -1442,222 +1452,107 @@ func (s) TestUnmarshalCluster(t *testing.T) {
 			},
 		})
 	)
-	const testVersion = "test-version-cds"
 
 	tests := []struct {
 		name       string
-		resources  []*anypb.Any
-		wantUpdate map[string]ClusterUpdateErrTuple
-		wantMD     UpdateMetadata
+		resource   *anypb.Any
+		wantName   string
+		wantUpdate ClusterUpdate
 		wantErr    bool
 	}{
 		{
-			name:      "non-cluster resource type",
-			resources: []*anypb.Any{{TypeUrl: version.V3HTTPConnManagerURL}},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusNACKed,
-				Version: testVersion,
-				ErrState: &UpdateErrorMetadata{
-					Version: testVersion,
-					Err:     cmpopts.AnyError,
-				},
-			},
-			wantErr: true,
+			name:     "non-cluster resource type",
+			resource: &anypb.Any{TypeUrl: version.V3HTTPConnManagerURL},
+			wantErr:  true,
 		},
 		{
 			name: "badly marshaled cluster resource",
-			resources: []*anypb.Any{
-				{
-					TypeUrl: version.V3ClusterURL,
-					Value:   []byte{1, 2, 3, 4},
-				},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusNACKed,
-				Version: testVersion,
-				ErrState: &UpdateErrorMetadata{
-					Version: testVersion,
-					Err:     cmpopts.AnyError,
-				},
+			resource: &anypb.Any{
+				TypeUrl: version.V3ClusterURL,
+				Value:   []byte{1, 2, 3, 4},
 			},
 			wantErr: true,
 		},
 		{
 			name: "bad cluster resource",
-			resources: []*anypb.Any{
-				testutils.MarshalAny(&v3clusterpb.Cluster{
-					Name:                 "test",
-					ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_STATIC},
-				}),
-			},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				"test": {Err: cmpopts.AnyError},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusNACKed,
-				Version: testVersion,
-				ErrState: &UpdateErrorMetadata{
-					Version: testVersion,
-					Err:     cmpopts.AnyError,
+			resource: testutils.MarshalAny(&v3clusterpb.Cluster{
+				Name:                 "test",
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_STATIC},
+			}),
+			wantName: "test",
+			wantErr:  true,
+		},
+		{
+			name: "cluster resource with non-self lrs_server field",
+			resource: testutils.MarshalAny(&v3clusterpb.Cluster{
+				Name:                 "test",
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: v3Service,
 				},
-			},
-			wantErr: true,
-		},
-		{
-			name:      "v2 cluster",
-			resources: []*anypb.Any{v2ClusterAny},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v2ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v2ClusterName,
-					EDSServiceName: v2Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v2ClusterAny,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			name:      "v2 cluster wrapped",
-			resources: []*anypb.Any{testutils.MarshalAny(&v2xdspb.Resource{Resource: v2ClusterAny})},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v2ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v2ClusterName,
-					EDSServiceName: v2Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v2ClusterAny,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			name:      "v3 cluster",
-			resources: []*anypb.Any{v3ClusterAny},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v3ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v3ClusterName,
-					EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v3ClusterAny,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			name:      "v3 cluster wrapped",
-			resources: []*anypb.Any{testutils.MarshalAny(&v3discoverypb.Resource{Resource: v3ClusterAny})},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v3ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v3ClusterName,
-					EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v3ClusterAny,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			name:      "v3 cluster with EDS config source self",
-			resources: []*anypb.Any{v3ClusterAnyWithEDSConfigSourceSelf},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v3ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v3ClusterName,
-					EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v3ClusterAnyWithEDSConfigSourceSelf,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			name:      "multiple clusters",
-			resources: []*anypb.Any{v2ClusterAny, v3ClusterAny},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v2ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v2ClusterName,
-					EDSServiceName: v2Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v2ClusterAny,
-				}},
-				v3ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v3ClusterName,
-					EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v3ClusterAny,
-				}},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusACKed,
-				Version: testVersion,
-			},
-		},
-		{
-			// To test that unmarshal keeps processing on errors.
-			name: "good and bad clusters",
-			resources: []*anypb.Any{
-				v2ClusterAny,
-				// bad cluster resource
-				testutils.MarshalAny(&v3clusterpb.Cluster{
-					Name:                 "bad",
-					ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_STATIC},
-				}),
-				v3ClusterAny,
-			},
-			wantUpdate: map[string]ClusterUpdateErrTuple{
-				v2ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v2ClusterName,
-					EDSServiceName: v2Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v2ClusterAny,
-				}},
-				v3ClusterName: {Update: ClusterUpdate{
-					ClusterName:    v3ClusterName,
-					EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
-					Raw: v3ClusterAny,
-				}},
-				"bad": {Err: cmpopts.AnyError},
-			},
-			wantMD: UpdateMetadata{
-				Status:  ServiceStatusNACKed,
-				Version: testVersion,
-				ErrState: &UpdateErrorMetadata{
-					Version: testVersion,
-					Err:     cmpopts.AnyError,
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				LrsServer: &v3corepb.ConfigSource{
+					ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+						Ads: &v3corepb.AggregatedConfigSource{},
+					},
 				},
+			}),
+			wantName: "test",
+			wantErr:  true,
+		},
+		{
+			name:     "v3 cluster",
+			resource: v3ClusterAny,
+			wantName: v3ClusterName,
+			wantUpdate: ClusterUpdate{
+				ClusterName:    v3ClusterName,
+				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
+				Raw: v3ClusterAny,
 			},
-			wantErr: true,
+		},
+		{
+			name:     "v3 cluster wrapped",
+			resource: testutils.MarshalAny(&v3discoverypb.Resource{Resource: v3ClusterAny}),
+			wantName: v3ClusterName,
+			wantUpdate: ClusterUpdate{
+				ClusterName:    v3ClusterName,
+				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
+				Raw: v3ClusterAny,
+			},
+		},
+		{
+			name:     "v3 cluster with EDS config source self",
+			resource: v3ClusterAnyWithEDSConfigSourceSelf,
+			wantName: v3ClusterName,
+			wantUpdate: ClusterUpdate{
+				ClusterName:    v3ClusterName,
+				EDSServiceName: v3Service, LRSServerConfig: ClusterLRSServerSelf,
+				Raw: v3ClusterAnyWithEDSConfigSourceSelf,
+			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			opts := &UnmarshalOptions{
-				Version:   testVersion,
-				Resources: test.resources,
-			}
-			update, md, err := UnmarshalCluster(opts)
+			name, update, err := unmarshalClusterResource(test.resource)
 			if (err != nil) != test.wantErr {
-				t.Fatalf("UnmarshalCluster(%+v), got err: %v, wantErr: %v", opts, err, test.wantErr)
+				t.Fatalf("unmarshalClusterResource(%s), got err: %v, wantErr: %v", pretty.ToJSON(test.resource), err, test.wantErr)
+			}
+			if name != test.wantName {
+				t.Errorf("unmarshalClusterResource(%s), got name: %s, want: %s", pretty.ToJSON(test.resource), name, test.wantName)
 			}
 			if diff := cmp.Diff(update, test.wantUpdate, cmpOpts); diff != "" {
-				t.Errorf("got unexpected update, diff (-got +want): %v", diff)
-			}
-			if diff := cmp.Diff(md, test.wantMD, cmpOptsIgnoreDetails); diff != "" {
-				t.Errorf("got unexpected metadata, diff (-got +want): %v", diff)
+				t.Errorf("unmarshalClusterResource(%s), got unexpected update, diff (-got +want): %v", pretty.ToJSON(test.resource), diff)
 			}
 		})
 	}
 }
 
 func (s) TestValidateClusterWithOutlierDetection(t *testing.T) {
-	oldOutlierDetectionSupportEnv := envconfig.XDSOutlierDetection
-	envconfig.XDSOutlierDetection = true
-	defer func() { envconfig.XDSOutlierDetection = oldOutlierDetectionSupportEnv }()
 	odToClusterProto := func(od *v3clusterpb.OutlierDetection) *v3clusterpb.Cluster {
 		// Cluster parsing doesn't fail with respect to fields orthogonal to
 		// outlier detection.

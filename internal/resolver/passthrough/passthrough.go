@@ -20,7 +20,11 @@
 // name without scheme back to gRPC as resolved address.
 package passthrough
 
-import "google.golang.org/grpc/resolver"
+import (
+	"errors"
+
+	"google.golang.org/grpc/resolver"
+)
 
 const scheme = "passthrough"
 
@@ -29,6 +33,9 @@ type passthroughBuilder struct{}
 // cc resolver.ClientConn 是 ccResolverWrapper
 
 func (*passthroughBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+	if target.Endpoint() == "" && opts.Dialer == nil {
+		return nil, errors.New("passthrough: received empty target in Build()")
+	}
 	r := &passthroughResolver{
 		target: target,
 		cc:     cc,
@@ -48,7 +55,7 @@ type passthroughResolver struct {
 
 func (r *passthroughResolver) start() {
 	// 这里调用的是ccResolverWrapper的UpdateState方法
-	r.cc.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: r.target.Endpoint}}})
+	r.cc.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: r.target.Endpoint()}}})
 }
 
 func (*passthroughResolver) ResolveNow(o resolver.ResolveNowOptions) {}

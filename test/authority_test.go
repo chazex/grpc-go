@@ -36,6 +36,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 )
@@ -98,10 +100,11 @@ type authorityTest struct {
 
 var authorityTests = []authorityTest{
 	{
-		name:      "UnixRelative",
-		address:   "sock.sock",
-		target:    "unix:sock.sock",
-		authority: "localhost",
+		name:           "UnixRelative",
+		address:        "sock.sock",
+		target:         "unix:sock.sock",
+		authority:      "localhost",
+		dialTargetWant: "unix:sock.sock",
 	},
 	{
 		name:           "UnixAbsolute",
@@ -111,10 +114,11 @@ var authorityTests = []authorityTest{
 		dialTargetWant: "unix:///tmp/sock.sock",
 	},
 	{
-		name:      "UnixAbsoluteAlternate",
-		address:   "/tmp/sock.sock",
-		target:    "unix:///tmp/sock.sock",
-		authority: "localhost",
+		name:           "UnixAbsoluteAlternate",
+		address:        "/tmp/sock.sock",
+		target:         "unix:///tmp/sock.sock",
+		authority:      "localhost",
+		dialTargetWant: "unix:///tmp/sock.sock",
 	},
 	{
 		name:           "UnixPassthrough",
@@ -125,10 +129,10 @@ var authorityTests = []authorityTest{
 	},
 	{
 		name:           "UnixAbstract",
-		address:        "\x00abc efg",
+		address:        "@abc efg",
 		target:         "unix-abstract:abc efg",
 		authority:      "localhost",
-		dialTargetWant: "\x00abc efg",
+		dialTargetWant: "unix:@abc efg",
 	},
 }
 
@@ -148,16 +152,11 @@ func (s) TestUnix(t *testing.T) {
 func (s) TestUnixCustomDialer(t *testing.T) {
 	for _, test := range authorityTests {
 		t.Run(test.name+"WithDialer", func(t *testing.T) {
-			if test.dialTargetWant == "" {
-				test.dialTargetWant = test.target
-			}
 			dialer := func(ctx context.Context, address string) (net.Conn, error) {
 				if address != test.dialTargetWant {
 					return nil, fmt.Errorf("expected target %v in custom dialer, instead got %v", test.dialTargetWant, address)
 				}
-				if !strings.HasPrefix(test.target, "unix-abstract:") {
-					address = address[len("unix:"):]
-				}
+				address = address[len("unix:"):]
 				return (&net.Dialer{}).DialContext(ctx, "unix", address)
 			}
 			runUnixTest(t, test.address, test.target, test.authority, dialer)
@@ -206,5 +205,37 @@ func (s) TestColonPortAuthority(t *testing.T) {
 	_, err = testpb.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{})
 	if err != nil {
 		t.Errorf("us.client.EmptyCall(_, _) = _, %v; want _, nil", err)
+	}
+}
+
+// TestAuthorityReplacedWithResolverAddress tests the scenario where the resolver
+// returned address contains a ServerName override. The test verifies that the the
+// :authority header value sent to the server as part of the http/2 HEADERS frame
+// is set to the value specified in the resolver returned address.
+func (s) TestAuthorityReplacedWithResolverAddress(t *testing.T) {
+	const expectedAuthority = "test.server.name"
+
+	ss := &stubserver.StubServer{
+		EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+			return authorityChecker(ctx, expectedAuthority)
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	r := manual.NewBuilderWithScheme("whatever")
+	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address, ServerName: expectedAuthority}}})
+	cc, err := grpc.Dial(r.Scheme()+":///whatever", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	if err != nil {
+		t.Fatalf("grpc.Dial(%q) = %v", ss.Address, err)
+	}
+	defer cc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if _, err = testpb.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{}); err != nil {
+		t.Fatalf("EmptyCall() rpc failed: %v", err)
 	}
 }

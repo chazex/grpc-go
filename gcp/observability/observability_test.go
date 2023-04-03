@@ -19,30 +19,28 @@
 package observability
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/trace"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	configpb "google.golang.org/grpc/gcp/observability/internal/config"
-	grpclogrecordpb "google.golang.org/grpc/gcp/observability/internal/logging"
-	iblog "google.golang.org/grpc/internal/binarylog"
+	"google.golang.org/grpc/internal/envconfig"
+	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/leakcheck"
-	testgrpc "google.golang.org/grpc/interop/grpc_testing"
-	testpb "google.golang.org/grpc/interop/grpc_testing"
+	"google.golang.org/grpc/internal/stubserver"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/grpc/test/grpc_testing"
 )
 
 type s struct {
@@ -74,277 +72,6 @@ var (
 	defaultRequestCount       = 24
 )
 
-type testServer struct {
-	testgrpc.UnimplementedTestServiceServer
-}
-
-func (s *testServer) UnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
-	if err := grpc.SendHeader(ctx, testHeaderMetadata); err != nil {
-		return nil, status.Errorf(status.Code(err), "grpc.SendHeader(_, %v) = %v, want <nil>", testHeaderMetadata, err)
-	}
-	if err := grpc.SetTrailer(ctx, testTrailerMetadata); err != nil {
-		return nil, status.Errorf(status.Code(err), "grpc.SetTrailer(_, %v) = %v, want <nil>", testTrailerMetadata, err)
-	}
-
-	if bytes.Equal(in.Payload.Body, testErrorPayload) {
-		return nil, fmt.Errorf(testErrorMessage)
-	}
-
-	return &testpb.SimpleResponse{Payload: in.Payload}, nil
-}
-
-type fakeLoggingExporter struct {
-	t            *testing.T
-	clientEvents []*grpclogrecordpb.GrpcLogRecord
-	serverEvents []*grpclogrecordpb.GrpcLogRecord
-	isClosed     bool
-	mu           sync.Mutex
-}
-
-func (fle *fakeLoggingExporter) EmitGrpcLogRecord(l *grpclogrecordpb.GrpcLogRecord) {
-	fle.mu.Lock()
-	defer fle.mu.Unlock()
-	switch l.EventLogger {
-	case grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT:
-		fle.clientEvents = append(fle.clientEvents, l)
-	case grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER:
-		fle.serverEvents = append(fle.serverEvents, l)
-	default:
-		fle.t.Fatalf("unexpected event logger: %v", l.EventLogger)
-	}
-	eventJSON, _ := protojson.Marshal(l)
-	fle.t.Logf("fakeLoggingExporter Emit: %s", eventJSON)
-}
-
-func (fle *fakeLoggingExporter) Close() error {
-	fle.isClosed = true
-	return nil
-}
-
-// test is an end-to-end test. It should be created with the newTest
-// func, modified as needed, and then started with its startServer method.
-// It should be cleaned up with the tearDown method.
-type test struct {
-	t   *testing.T
-	fle *fakeLoggingExporter
-	fe  *fakeOpenCensusExporter
-
-	testServer testgrpc.TestServiceServer // nil means none
-	// srv and srvAddr are set once startServer is called.
-	srv     *grpc.Server
-	srvAddr string
-
-	cc *grpc.ClientConn // nil until requested via clientConn
-}
-
-func (te *test) tearDown() {
-	if te.cc != nil {
-		te.cc.Close()
-		te.cc = nil
-	}
-	te.srv.Stop()
-	End()
-
-	if te.fle != nil && !te.fle.isClosed {
-		te.t.Fatalf("fakeLoggingExporter not closed!")
-	}
-}
-
-// newTest returns a new test using the provided testing.T and
-// environment.  It is returned with default values. Tests should
-// modify it before calling its startServer and clientConn methods.
-func newTest(t *testing.T) *test {
-	return &test{
-		t: t,
-	}
-}
-
-// startServer starts a gRPC server listening. Callers should defer a
-// call to te.tearDown to clean up.
-func (te *test) startServer(ts testgrpc.TestServiceServer) {
-	te.testServer = ts
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		te.t.Fatalf("Failed to listen: %v", err)
-	}
-	var opts []grpc.ServerOption
-	s := grpc.NewServer(opts...)
-	te.srv = s
-	if te.testServer != nil {
-		testgrpc.RegisterTestServiceServer(s, te.testServer)
-	}
-
-	go s.Serve(lis)
-	te.srvAddr = lis.Addr().String()
-}
-
-func (te *test) clientConn() *grpc.ClientConn {
-	if te.cc != nil {
-		return te.cc
-	}
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithUserAgent("test/0.0.1"),
-	}
-	var err error
-	te.cc, err = grpc.Dial(te.srvAddr, opts...)
-	if err != nil {
-		te.t.Fatalf("Dial(%q) = %v", te.srvAddr, err)
-	}
-	return te.cc
-}
-
-func (te *test) enablePluginWithConfig(config *configpb.ObservabilityConfig) {
-	// Injects the fake exporter for testing purposes
-	te.fle = &fakeLoggingExporter{t: te.t}
-	defaultLogger = newBinaryLogger(nil)
-	iblog.SetLogger(defaultLogger)
-	if err := defaultLogger.start(config, te.fle); err != nil {
-		te.t.Fatalf("Failed to start plugin: %v", err)
-	}
-}
-
-func (te *test) enablePluginWithCaptureAll() {
-	te.enablePluginWithConfig(&configpb.ObservabilityConfig{
-		EnableCloudLogging:   true,
-		DestinationProjectId: "fake",
-		LogFilters: []*configpb.ObservabilityConfig_LogFilter{
-			{
-				Pattern:      "*",
-				HeaderBytes:  infinitySizeBytes,
-				MessageBytes: infinitySizeBytes,
-			},
-		},
-	})
-}
-
-func (te *test) enableOpenCensus() {
-	defaultMetricsReportingInterval = time.Millisecond * 100
-	config := &configpb.ObservabilityConfig{
-		EnableCloudLogging:      true,
-		EnableCloudTrace:        true,
-		EnableCloudMonitoring:   true,
-		GlobalTraceSamplingRate: 1.0,
-	}
-	te.fe = &fakeOpenCensusExporter{SeenViews: make(map[string]string), t: te.t}
-	startOpenCensus(config, te.fe)
-}
-
-func checkEventCommon(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord) {
-	if seen.RpcId == "" {
-		t.Fatalf("expect non-empty RpcId")
-	}
-	if seen.SequenceId == 0 {
-		t.Fatalf("expect non-zero SequenceId")
-	}
-}
-
-func checkEventRequestHeader(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord, want *grpclogrecordpb.GrpcLogRecord) {
-	checkEventCommon(t, seen)
-	if seen.EventType != grpclogrecordpb.GrpcLogRecord_GRPC_CALL_REQUEST_HEADER {
-		t.Fatalf("got %v, want GrpcLogRecord_GRPC_CALL_REQUEST_HEADER", seen.EventType.String())
-	}
-	if seen.EventLogger != want.EventLogger {
-		t.Fatalf("l.EventLogger = %v, want %v", seen.EventLogger, want.EventLogger)
-	}
-	if want.Authority != "" && seen.Authority != want.Authority {
-		t.Fatalf("l.Authority = %v, want %v", seen.Authority, want.Authority)
-	}
-	if want.ServiceName != "" && seen.ServiceName != want.ServiceName {
-		t.Fatalf("l.ServiceName = %v, want %v", seen.ServiceName, want.ServiceName)
-	}
-	if want.MethodName != "" && seen.MethodName != want.MethodName {
-		t.Fatalf("l.MethodName = %v, want %v", seen.MethodName, want.MethodName)
-	}
-	if len(seen.Metadata.Entry) != 1 {
-		t.Fatalf("unexpected header size: %v != 1", len(seen.Metadata.Entry))
-	}
-	if seen.Metadata.Entry[0].Key != "header" {
-		t.Fatalf("unexpected header: %v", seen.Metadata.Entry[0].Key)
-	}
-	if !bytes.Equal(seen.Metadata.Entry[0].Value, []byte(testHeaderMetadata["header"][0])) {
-		t.Fatalf("unexpected header value: %v", seen.Metadata.Entry[0].Value)
-	}
-}
-
-func checkEventResponseHeader(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord, want *grpclogrecordpb.GrpcLogRecord) {
-	checkEventCommon(t, seen)
-	if seen.EventType != grpclogrecordpb.GrpcLogRecord_GRPC_CALL_RESPONSE_HEADER {
-		t.Fatalf("got %v, want GrpcLogRecord_GRPC_CALL_RESPONSE_HEADER", seen.EventType.String())
-	}
-	if seen.EventLogger != want.EventLogger {
-		t.Fatalf("l.EventLogger = %v, want %v", seen.EventLogger, want.EventLogger)
-	}
-	if len(seen.Metadata.Entry) != 1 {
-		t.Fatalf("unexpected header size: %v != 1", len(seen.Metadata.Entry))
-	}
-	if seen.Metadata.Entry[0].Key != "header" {
-		t.Fatalf("unexpected header: %v", seen.Metadata.Entry[0].Key)
-	}
-	if !bytes.Equal(seen.Metadata.Entry[0].Value, []byte(testHeaderMetadata["header"][0])) {
-		t.Fatalf("unexpected header value: %v", seen.Metadata.Entry[0].Value)
-	}
-}
-
-func checkEventRequestMessage(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord, want *grpclogrecordpb.GrpcLogRecord, payload []byte) {
-	checkEventCommon(t, seen)
-	if seen.EventType != grpclogrecordpb.GrpcLogRecord_GRPC_CALL_REQUEST_MESSAGE {
-		t.Fatalf("got %v, want GrpcLogRecord_GRPC_CALL_REQUEST_MESSAGE", seen.EventType.String())
-	}
-	if seen.EventLogger != want.EventLogger {
-		t.Fatalf("l.EventLogger = %v, want %v", seen.EventLogger, want.EventLogger)
-	}
-	msg := &testpb.SimpleRequest{Payload: &testpb.Payload{Body: payload}}
-	msgBytes, _ := proto.Marshal(msg)
-	if !bytes.Equal(seen.Message, msgBytes) {
-		t.Fatalf("unexpected payload: %v != %v", seen.Message, payload)
-	}
-}
-
-func checkEventResponseMessage(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord, want *grpclogrecordpb.GrpcLogRecord, payload []byte) {
-	checkEventCommon(t, seen)
-	if seen.EventType != grpclogrecordpb.GrpcLogRecord_GRPC_CALL_RESPONSE_MESSAGE {
-		t.Fatalf("got %v, want GrpcLogRecord_GRPC_CALL_RESPONSE_MESSAGE", seen.EventType.String())
-	}
-	if seen.EventLogger != want.EventLogger {
-		t.Fatalf("l.EventLogger = %v, want %v", seen.EventLogger, want.EventLogger)
-	}
-	msg := &testpb.SimpleResponse{Payload: &testpb.Payload{Body: payload}}
-	msgBytes, _ := proto.Marshal(msg)
-	if !bytes.Equal(seen.Message, msgBytes) {
-		t.Fatalf("unexpected payload: %v != %v", seen.Message, payload)
-	}
-}
-
-func checkEventTrailer(t *testing.T, seen *grpclogrecordpb.GrpcLogRecord, want *grpclogrecordpb.GrpcLogRecord) {
-	checkEventCommon(t, seen)
-	if seen.EventType != grpclogrecordpb.GrpcLogRecord_GRPC_CALL_TRAILER {
-		t.Fatalf("got %v, want GrpcLogRecord_GRPC_CALL_TRAILER", seen.EventType.String())
-	}
-	if seen.EventLogger != want.EventLogger {
-		t.Fatalf("l.EventLogger = %v, want %v", seen.EventLogger, want.EventLogger)
-	}
-	if seen.StatusCode != want.StatusCode {
-		t.Fatalf("l.StatusCode = %v, want %v", seen.StatusCode, want.StatusCode)
-	}
-	if seen.StatusMessage != want.StatusMessage {
-		t.Fatalf("l.StatusMessage = %v, want %v", seen.StatusMessage, want.StatusMessage)
-	}
-	if !bytes.Equal(seen.StatusDetails, want.StatusDetails) {
-		t.Fatalf("l.StatusDetails = %v, want %v", seen.StatusDetails, want.StatusDetails)
-	}
-	if len(seen.Metadata.Entry) != 1 {
-		t.Fatalf("unexpected trailer size: %v != 1", len(seen.Metadata.Entry))
-	}
-	if seen.Metadata.Entry[0].Key != "trailer" {
-		t.Fatalf("unexpected trailer: %v", seen.Metadata.Entry[0].Key)
-	}
-	if !bytes.Equal(seen.Metadata.Entry[0].Value, []byte(testTrailerMetadata["trailer"][0])) {
-		t.Fatalf("unexpected trailer value: %v", seen.Metadata.Entry[0].Value)
-	}
-}
-
 const (
 	TypeOpenCensusViewDistribution string = "distribution"
 	TypeOpenCensusViewCount               = "count"
@@ -357,6 +84,8 @@ type fakeOpenCensusExporter struct {
 	SeenViews map[string]string
 	// Number of spans
 	SeenSpans int
+
+	idCh *testutils.Channel
 
 	t  *testing.T
 	mu sync.RWMutex
@@ -380,310 +109,241 @@ func (fe *fakeOpenCensusExporter) ExportView(vd *view.Data) {
 	}
 }
 
+type traceAndSpanID struct {
+	spanName  string
+	traceID   trace.TraceID
+	spanID    trace.SpanID
+	isSampled bool
+}
+
+type traceAndSpanIDString struct {
+	traceID   string
+	spanID    string
+	isSampled bool
+}
+
+// idsToString is a helper that converts from generated trace and span IDs to
+// the string version stored in trace message events.
+func (tasi *traceAndSpanID) idsToString(projectID string) traceAndSpanIDString {
+	return traceAndSpanIDString{
+		traceID:   "projects/" + projectID + "/traces/" + tasi.traceID.String(),
+		spanID:    tasi.spanID.String(),
+		isSampled: tasi.isSampled,
+	}
+}
+
 func (fe *fakeOpenCensusExporter) ExportSpan(vd *trace.SpanData) {
+	if fe.idCh != nil {
+		// This is what export span sees representing the trace/span ID which
+		// will populate different contexts throughout the system, convert in
+		// caller to string version as the logging code does.
+		fe.idCh.Send(traceAndSpanID{
+			spanName:  vd.Name,
+			traceID:   vd.TraceID,
+			spanID:    vd.SpanID,
+			isSampled: vd.IsSampled(),
+		})
+	}
+
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
 	fe.SeenSpans++
 	fe.t.Logf("Span[%v]", vd.Name)
 }
 
-func (s) TestLoggingForOkCall(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	te.enablePluginWithCaptureAll()
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
+func (fe *fakeOpenCensusExporter) Flush() {}
 
-	var (
-		resp *testpb.SimpleResponse
-		req  *testpb.SimpleRequest
-		err  error
-	)
-	req = &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testOkPayload}}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	resp, err = tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-	if err != nil {
-		t.Fatalf("unary call failed: %v", err)
-	}
-	t.Logf("unary call passed: %v", resp)
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-	// Check size of events
-	if len(te.fle.clientEvents) != 5 {
-		t.Fatalf("expects 5 client events, got %d", len(te.fle.clientEvents))
-	}
-	if len(te.fle.serverEvents) != 5 {
-		t.Fatalf("expects 5 server events, got %d", len(te.fle.serverEvents))
-	}
-	// Client events
-	checkEventRequestHeader(te.t, te.fle.clientEvents[0], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-		Authority:   te.srvAddr,
-		ServiceName: "grpc.testing.TestService",
-		MethodName:  "UnaryCall",
-	})
-	checkEventRequestMessage(te.t, te.fle.clientEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	}, testOkPayload)
-	checkEventResponseHeader(te.t, te.fle.clientEvents[2], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	})
-	checkEventResponseMessage(te.t, te.fle.clientEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	}, testOkPayload)
-	checkEventTrailer(te.t, te.fle.clientEvents[4], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-		StatusCode:  0,
-	})
-	// Server events
-	checkEventRequestHeader(te.t, te.fle.serverEvents[0], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	})
-	checkEventRequestMessage(te.t, te.fle.serverEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	}, testOkPayload)
-	checkEventResponseHeader(te.t, te.fle.serverEvents[2], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	})
-	checkEventResponseMessage(te.t, te.fle.serverEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	}, testOkPayload)
-	checkEventTrailer(te.t, te.fle.serverEvents[4], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-		StatusCode:  0,
-	})
-}
-
-func (s) TestLoggingForErrorCall(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	te.enablePluginWithCaptureAll()
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
-
-	req := &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testErrorPayload}}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	_, err := tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-	if err == nil {
-		t.Fatalf("unary call expected to fail, but passed")
-	}
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-	// Check size of events
-	if len(te.fle.clientEvents) != 4 {
-		t.Fatalf("expects 4 client events, got %d", len(te.fle.clientEvents))
-	}
-	if len(te.fle.serverEvents) != 4 {
-		t.Fatalf("expects 4 server events, got %d", len(te.fle.serverEvents))
-	}
-	// Client events
-	checkEventRequestHeader(te.t, te.fle.clientEvents[0], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-		Authority:   te.srvAddr,
-		ServiceName: "grpc.testing.TestService",
-		MethodName:  "UnaryCall",
-	})
-	checkEventRequestMessage(te.t, te.fle.clientEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	}, testErrorPayload)
-	checkEventResponseHeader(te.t, te.fle.clientEvents[2], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	})
-	checkEventTrailer(te.t, te.fle.clientEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger:   grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-		StatusCode:    2,
-		StatusMessage: testErrorMessage,
-	})
-	// Server events
-	checkEventRequestHeader(te.t, te.fle.serverEvents[0], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	})
-	checkEventRequestMessage(te.t, te.fle.serverEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	}, testErrorPayload)
-	checkEventResponseHeader(te.t, te.fle.serverEvents[2], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	})
-	checkEventTrailer(te.t, te.fle.serverEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger:   grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-		StatusCode:    2,
-		StatusMessage: testErrorMessage,
-	})
-}
-
-func (s) TestEmptyConfig(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	te.enablePluginWithConfig(&configpb.ObservabilityConfig{})
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
-
-	req := &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testOkPayload}}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	resp, err := tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-	if err != nil {
-		t.Fatalf("unary call failed: %v", err)
-	}
-	t.Logf("unary call passed: %v", resp)
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-	// Check size of events
-	if len(te.fle.clientEvents) != 0 {
-		t.Fatalf("expects 0 client events, got %d", len(te.fle.clientEvents))
-	}
-	if len(te.fle.serverEvents) != 0 {
-		t.Fatalf("expects 0 server events, got %d", len(te.fle.serverEvents))
-	}
-}
-
-func (s) TestOverrideConfig(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	// Setting 3 filters, expected to use the third filter, because it's the
-	// most specific one. The third filter allows message payload logging, and
-	// others disabling the message payload logging. We should observe this
-	// behavior latter.
-	te.enablePluginWithConfig(&configpb.ObservabilityConfig{
-		EnableCloudLogging:   true,
-		DestinationProjectId: "fake",
-		LogFilters: []*configpb.ObservabilityConfig_LogFilter{
-			{
-				Pattern:      "wont/match",
-				MessageBytes: 0,
-			},
-			{
-				Pattern:      "*",
-				MessageBytes: 0,
-			},
-			{
-				Pattern:      "grpc.testing.TestService/*",
-				MessageBytes: 4096,
-			},
-		},
-	})
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
-
-	var (
-		resp *testpb.SimpleResponse
-		req  *testpb.SimpleRequest
-		err  error
-	)
-	req = &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testOkPayload}}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	resp, err = tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-	if err != nil {
-		t.Fatalf("unary call failed: %v", err)
-	}
-	t.Logf("unary call passed: %v", resp)
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-	// Check size of events
-	if len(te.fle.clientEvents) != 5 {
-		t.Fatalf("expects 5 client events, got %d", len(te.fle.clientEvents))
-	}
-	if len(te.fle.serverEvents) != 5 {
-		t.Fatalf("expects 5 server events, got %d", len(te.fle.serverEvents))
-	}
-	// Check Client message payloads
-	checkEventRequestMessage(te.t, te.fle.clientEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	}, testOkPayload)
-	checkEventResponseMessage(te.t, te.fle.clientEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_CLIENT,
-	}, testOkPayload)
-	// Check Server message payloads
-	checkEventRequestMessage(te.t, te.fle.serverEvents[1], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	}, testOkPayload)
-	checkEventResponseMessage(te.t, te.fle.serverEvents[3], &grpclogrecordpb.GrpcLogRecord{
-		EventLogger: grpclogrecordpb.GrpcLogRecord_LOGGER_SERVER,
-	}, testOkPayload)
-}
-
-func (s) TestNoMatch(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	// Setting 3 filters, expected to use the second filter. The second filter
-	// allows message payload logging, and others disabling the message payload
-	// logging. We should observe this behavior latter.
-	te.enablePluginWithConfig(&configpb.ObservabilityConfig{
-		EnableCloudLogging:   true,
-		DestinationProjectId: "fake",
-		LogFilters: []*configpb.ObservabilityConfig_LogFilter{
-			{
-				Pattern:      "wont/match",
-				MessageBytes: 0,
-			},
-		},
-	})
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
-
-	var (
-		resp *testpb.SimpleResponse
-		req  *testpb.SimpleRequest
-		err  error
-	)
-	req = &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testOkPayload}}
-	tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	resp, err = tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-	if err != nil {
-		t.Fatalf("unary call failed: %v", err)
-	}
-	t.Logf("unary call passed: %v", resp)
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-	// Check size of events
-	if len(te.fle.clientEvents) != 0 {
-		t.Fatalf("expects 0 client events, got %d", len(te.fle.clientEvents))
-	}
-	if len(te.fle.serverEvents) != 0 {
-		t.Fatalf("expects 0 server events, got %d", len(te.fle.serverEvents))
-	}
+func (fe *fakeOpenCensusExporter) Close() error {
+	return nil
 }
 
 func (s) TestRefuseStartWithInvalidPatterns(t *testing.T) {
-	config := &configpb.ObservabilityConfig{
-		EnableCloudLogging:   true,
-		DestinationProjectId: "fake",
-		LogFilters: []*configpb.ObservabilityConfig_LogFilter{
-			{
-				Pattern: ":-)",
-			},
-			{
-				Pattern: "*",
+	invalidConfig := &config{
+		ProjectID: "fake",
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{":-)"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
 			},
 		},
 	}
-	configJSON, err := protojson.Marshal(config)
+	invalidConfigJSON, err := json.Marshal(invalidConfig)
 	if err != nil {
 		t.Fatalf("failed to convert config to JSON: %v", err)
 	}
-	os.Setenv(envObservabilityConfig, string(configJSON))
+	oldObservabilityConfig := envconfig.ObservabilityConfig
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfig = string(invalidConfigJSON)
+	envconfig.ObservabilityConfigFile = ""
+	defer func() {
+		envconfig.ObservabilityConfig = oldObservabilityConfig
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}()
 	// If there is at least one invalid pattern, which should not be silently tolerated.
 	if err := Start(context.Background()); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
 	}
 }
 
+// TestRefuseStartWithExcludeAndWildCardAll tests the sceanrio where an
+// observability configuration is provided with client RPC event specifying to
+// exclude, and which matches on the '*' wildcard (any). This should cause an
+// error when trying to start the observability system.
+func (s) TestRefuseStartWithExcludeAndWildCardAll(t *testing.T) {
+	invalidConfig := &config{
+		ProjectID: "fake",
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{"*"},
+					Exclude:          true,
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+	}
+	invalidConfigJSON, err := json.Marshal(invalidConfig)
+	if err != nil {
+		t.Fatalf("failed to convert config to JSON: %v", err)
+	}
+	oldObservabilityConfig := envconfig.ObservabilityConfig
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfig = string(invalidConfigJSON)
+	envconfig.ObservabilityConfigFile = ""
+	defer func() {
+		envconfig.ObservabilityConfig = oldObservabilityConfig
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}()
+	// If there is at least one invalid pattern, which should not be silently tolerated.
+	if err := Start(context.Background()); err == nil {
+		t.Fatalf("Invalid patterns not triggering error")
+	}
+}
+
+// createTmpConfigInFileSystem creates a random observability config at a random
+// place in the temporary portion of the file system dependent on system. It
+// also sets the environment variable GRPC_CONFIG_OBSERVABILITY_JSON to point to
+// this created config.
+func createTmpConfigInFileSystem(rawJSON string) (func(), error) {
+	configJSONFile, err := os.CreateTemp(os.TempDir(), "configJSON-")
+	if err != nil {
+		return nil, fmt.Errorf("cannot create file %v: %v", configJSONFile.Name(), err)
+	}
+	_, err = configJSONFile.Write(json.RawMessage(rawJSON))
+	if err != nil {
+		return nil, fmt.Errorf("cannot write marshalled JSON: %v", err)
+	}
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfigFile = configJSONFile.Name()
+	return func() {
+		configJSONFile.Close()
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}, nil
+}
+
+// TestJSONEnvVarSet tests a valid observability configuration specified by the
+// GRPC_CONFIG_OBSERVABILITY_JSON environment variable, whose value represents a
+// file path pointing to a JSON encoded config.
+func (s) TestJSONEnvVarSet(t *testing.T) {
+	configJSON := `{
+		"project_id": "fake"
+	}`
+	cleanup, err := createTmpConfigInFileSystem(configJSON)
+	defer cleanup()
+
+	if err != nil {
+		t.Fatalf("failed to create config in file system: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := Start(ctx); err != nil {
+		t.Fatalf("error starting observability with valid config through file system: %v", err)
+	}
+	defer End()
+}
+
+// TestBothConfigEnvVarsSet tests the scenario where both configuration
+// environment variables are set. The file system environment variable should
+// take precedence, and an error should return in the case of the file system
+// configuration being invalid, even if the direct configuration environment
+// variable is set and valid.
+func (s) TestBothConfigEnvVarsSet(t *testing.T) {
+	invalidConfig := &config{
+		ProjectID: "fake",
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{":-)"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+	}
+	invalidConfigJSON, err := json.Marshal(invalidConfig)
+	if err != nil {
+		t.Fatalf("failed to convert config to JSON: %v", err)
+	}
+	cleanup, err := createTmpConfigInFileSystem(string(invalidConfigJSON))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("failed to create config in file system: %v", err)
+	}
+	// This configuration should be ignored, as precedence 2.
+	validConfig := &config{
+		ProjectID: "fake",
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{"*"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+	}
+	validConfigJSON, err := json.Marshal(validConfig)
+	if err != nil {
+		t.Fatalf("failed to convert config to JSON: %v", err)
+	}
+	oldObservabilityConfig := envconfig.ObservabilityConfig
+	envconfig.ObservabilityConfig = string(validConfigJSON)
+	defer func() {
+		envconfig.ObservabilityConfig = oldObservabilityConfig
+	}()
+	if err := Start(context.Background()); err == nil {
+		t.Fatalf("Invalid patterns not triggering error")
+	}
+}
+
+// TestErrInFileSystemEnvVar tests the scenario where an observability
+// configuration is specified with environment variable that specifies a
+// location in the file system for configuration, and this location doesn't have
+// a file (or valid configuration).
+func (s) TestErrInFileSystemEnvVar(t *testing.T) {
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfigFile = "/this-file/does-not-exist"
+	defer func() {
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}()
+	if err := Start(context.Background()); err == nil {
+		t.Fatalf("Invalid file system path not triggering error")
+	}
+}
+
 func (s) TestNoEnvSet(t *testing.T) {
-	os.Setenv(envObservabilityConfig, "")
+	oldObservabilityConfig := envconfig.ObservabilityConfig
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfig = ""
+	envconfig.ObservabilityConfigFile = ""
+	defer func() {
+		envconfig.ObservabilityConfig = oldObservabilityConfig
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}()
 	// If there is no observability config set at all, the Start should return an error.
 	if err := Start(context.Background()); err == nil {
 		t.Fatalf("Invalid patterns not triggering error")
@@ -691,43 +351,110 @@ func (s) TestNoEnvSet(t *testing.T) {
 }
 
 func (s) TestOpenCensusIntegration(t *testing.T) {
-	te := newTest(t)
-	defer te.tearDown()
-	te.enableOpenCensus()
-	te.startServer(&testServer{})
-	tc := testgrpc.NewTestServiceClient(te.clientConn())
+	defaultMetricsReportingInterval = time.Millisecond * 100
+	fe := &fakeOpenCensusExporter{SeenViews: make(map[string]string), t: t}
+
+	defer func(ne func(config *config) (tracingMetricsExporter, error)) {
+		newExporter = ne
+	}(newExporter)
+
+	newExporter = func(config *config) (tracingMetricsExporter, error) {
+		return fe, nil
+	}
+
+	openCensusOnConfig := &config{
+		ProjectID:       "fake",
+		CloudMonitoring: &cloudMonitoring{},
+		CloudTrace: &cloudTrace{
+			SamplingRate: 1.0,
+		},
+	}
+	cleanup, err := setupObservabilitySystemWithConfig(openCensusOnConfig)
+	if err != nil {
+		t.Fatalf("error setting up observability %v", err)
+	}
+	defer cleanup()
+
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+			return &grpc_testing.SimpleResponse{}, nil
+		},
+		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+			for {
+				_, err := stream.Recv()
+				if err == io.EOF {
+					return nil
+				}
+			}
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
 
 	for i := 0; i < defaultRequestCount; i++ {
-		req := &testpb.SimpleRequest{Payload: &testpb.Payload{Body: testOkPayload}}
-		tCtx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 		defer cancel()
-		_, err := tc.UnaryCall(metadata.NewOutgoingContext(tCtx, testHeaderMetadata), req)
-		if err != nil {
-			t.Fatalf("unary call failed: %v", err)
+		if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: testOkPayload}}); err != nil {
+			t.Fatalf("Unexpected error from UnaryCall: %v", err)
 		}
 	}
 	t.Logf("unary call passed count=%v", defaultRequestCount)
-
-	// Wait for the gRPC transport to gracefully close to ensure no lost event.
-	te.cc.Close()
-	te.srv.GracefulStop()
-
-	var errs []error
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	stream, err := ss.Client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("ss.Client.FullDuplexCall failed: %f", err)
+	}
+
+	stream.CloseSend()
+	if _, err = stream.Recv(); err != io.EOF {
+		t.Fatalf("unexpected error: %v, expected an EOF error", err)
+	}
+
+	var errs []error
 	for ctx.Err() == nil {
 		errs = nil
-		te.fe.mu.RLock()
-		if value := te.fe.SeenViews["grpc.io/client/completed_rpcs"]; value != TypeOpenCensusViewCount {
+		fe.mu.RLock()
+		if value := fe.SeenViews["grpc.io/client/api_latency"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/api_latency: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if value := fe.SeenViews["grpc.io/client/started_rpcs"]; value != TypeOpenCensusViewCount {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/started_rpcs: %s != %s", value, TypeOpenCensusViewCount))
+		}
+		if value := fe.SeenViews["grpc.io/server/started_rpcs"]; value != TypeOpenCensusViewCount {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/server/started_rpcs: %s != %s", value, TypeOpenCensusViewCount))
+		}
+
+		if value := fe.SeenViews["grpc.io/client/completed_rpcs"]; value != TypeOpenCensusViewCount {
 			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/completed_rpcs: %s != %s", value, TypeOpenCensusViewCount))
 		}
-		if value := te.fe.SeenViews["grpc.io/server/completed_rpcs"]; value != TypeOpenCensusViewCount {
+		if value := fe.SeenViews["grpc.io/server/completed_rpcs"]; value != TypeOpenCensusViewCount {
 			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/server/completed_rpcs: %s != %s", value, TypeOpenCensusViewCount))
 		}
-		if te.fe.SeenSpans <= 0 {
-			errs = append(errs, fmt.Errorf("unexpected number of seen spans: %v <= 0", te.fe.SeenSpans))
+		if value := fe.SeenViews["grpc.io/client/roundtrip_latency"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/completed_rpcs: %s != %s", value, TypeOpenCensusViewDistribution))
 		}
-		te.fe.mu.RUnlock()
+		if value := fe.SeenViews["grpc.io/server/server_latency"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("grpc.io/server/server_latency: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if value := fe.SeenViews["grpc.io/client/sent_compressed_message_bytes_per_rpc"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/sent_compressed_message_bytes_per_rpc: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if value := fe.SeenViews["grpc.io/client/received_compressed_message_bytes_per_rpc"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/client/received_compressed_message_bytes_per_rpc: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if value := fe.SeenViews["grpc.io/server/sent_compressed_message_bytes_per_rpc"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/server/sent_compressed_message_bytes_per_rpc: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if value := fe.SeenViews["grpc.io/server/received_compressed_message_bytes_per_rpc"]; value != TypeOpenCensusViewDistribution {
+			errs = append(errs, fmt.Errorf("unexpected type for grpc.io/server/received_compressed_message_bytes_per_rpc: %s != %s", value, TypeOpenCensusViewDistribution))
+		}
+		if fe.SeenSpans <= 0 {
+			errs = append(errs, fmt.Errorf("unexpected number of seen spans: %v <= 0", fe.SeenSpans))
+		}
+		fe.mu.RUnlock()
 		if len(errs) == 0 {
 			break
 		}
@@ -735,5 +462,611 @@ func (s) TestOpenCensusIntegration(t *testing.T) {
 	}
 	if len(errs) != 0 {
 		t.Fatalf("Invalid OpenCensus export data: %v", errs)
+	}
+}
+
+// TestCustomTagsTracingMetrics verifies that the custom tags defined in our
+// observability configuration and set to two hardcoded values are passed to the
+// function to create an exporter.
+func (s) TestCustomTagsTracingMetrics(t *testing.T) {
+	defer func(ne func(config *config) (tracingMetricsExporter, error)) {
+		newExporter = ne
+	}(newExporter)
+	fe := &fakeOpenCensusExporter{SeenViews: make(map[string]string), t: t}
+	newExporter = func(config *config) (tracingMetricsExporter, error) {
+		ct := config.Labels
+		if len(ct) < 1 {
+			t.Fatalf("less than 2 custom tags sent in")
+		}
+		if val, ok := ct["customtag1"]; !ok || val != "wow" {
+			t.Fatalf("incorrect custom tag: got %v, want %v", val, "wow")
+		}
+		if val, ok := ct["customtag2"]; !ok || val != "nice" {
+			t.Fatalf("incorrect custom tag: got %v, want %v", val, "nice")
+		}
+		return fe, nil
+	}
+
+	// This configuration present in file system and it's defined custom tags should make it
+	// to the created exporter.
+	configJSON := `{
+		"project_id": "fake",
+		"cloud_trace": {},
+		"cloud_monitoring": {"sampling_rate": 1.0},
+		"labels":{"customtag1":"wow","customtag2":"nice"}
+	}`
+
+	cleanup, err := createTmpConfigInFileSystem(configJSON)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	err = Start(ctx)
+	defer End()
+	if err != nil {
+		t.Fatalf("Start() failed with err: %v", err)
+	}
+}
+
+// TestStartErrorsThenEnd tests that an End call after Start errors works
+// without problems, as this is a possible codepath in the public observability
+// API.
+func (s) TestStartErrorsThenEnd(t *testing.T) {
+	invalidConfig := &config{
+		ProjectID: "fake",
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{":-)"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+	}
+	invalidConfigJSON, err := json.Marshal(invalidConfig)
+	if err != nil {
+		t.Fatalf("failed to convert config to JSON: %v", err)
+	}
+	oldObservabilityConfig := envconfig.ObservabilityConfig
+	oldObservabilityConfigFile := envconfig.ObservabilityConfigFile
+	envconfig.ObservabilityConfig = string(invalidConfigJSON)
+	envconfig.ObservabilityConfigFile = ""
+	defer func() {
+		envconfig.ObservabilityConfig = oldObservabilityConfig
+		envconfig.ObservabilityConfigFile = oldObservabilityConfigFile
+	}()
+	if err := Start(context.Background()); err == nil {
+		t.Fatalf("Invalid patterns not triggering error")
+	}
+	End()
+}
+
+// TestLoggingLinkedWithTraceClientSide tests that client side logs get the
+// trace and span id corresponding to the created Call Level Span for the RPC.
+func (s) TestLoggingLinkedWithTraceClientSide(t *testing.T) {
+	fle := &fakeLoggingExporter{
+		t: t,
+	}
+	oldNewLoggingExporter := newLoggingExporter
+	defer func() {
+		newLoggingExporter = oldNewLoggingExporter
+	}()
+
+	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+		return fle, nil
+	}
+
+	idCh := testutils.NewChannel()
+
+	fe := &fakeOpenCensusExporter{
+		t:    t,
+		idCh: idCh,
+	}
+	oldNewExporter := newExporter
+	defer func() {
+		newExporter = oldNewExporter
+	}()
+
+	newExporter = func(config *config) (tracingMetricsExporter, error) {
+		return fe, nil
+	}
+
+	const projectID = "project-id"
+	tracesAndLogsConfig := &config{
+		ProjectID: projectID,
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{"*"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+		CloudTrace: &cloudTrace{
+			SamplingRate: 1.0,
+		},
+	}
+	cleanup, err := setupObservabilitySystemWithConfig(tracesAndLogsConfig)
+	if err != nil {
+		t.Fatalf("error setting up observability %v", err)
+	}
+	defer cleanup()
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+			return &grpc_testing.SimpleResponse{}, nil
+		},
+		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+			_, err := stream.Recv()
+			if err != io.EOF {
+				return err
+			}
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	// Spawn a goroutine to receive the trace and span ids received by the
+	// exporter corresponding to a Unary RPC.
+	readerErrCh := testutils.NewChannel()
+	unaryDone := grpcsync.NewEvent()
+	go func() {
+		var traceAndSpanIDs []traceAndSpanID
+		val, err := idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok := val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+		<-unaryDone.Done()
+		var tasiSent traceAndSpanIDString
+		for _, tasi := range traceAndSpanIDs {
+			if strings.HasPrefix(tasi.spanName, "Sent.") {
+				tasiSent = tasi.idsToString(projectID)
+				continue
+			}
+		}
+
+		fle.mu.Lock()
+		for _, tasiSeen := range fle.idsSeen {
+			if diff := cmp.Diff(tasiSeen, &tasiSent, cmp.AllowUnexported(traceAndSpanIDString{})); diff != "" {
+				readerErrCh.Send(errors.New("got unexpected id, should be a client span"))
+			}
+		}
+
+		fle.entries = nil
+		fle.mu.Unlock()
+		readerErrCh.Send(nil)
+	}()
+	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: testOkPayload}}); err != nil {
+		t.Fatalf("Unexpected error from UnaryCall: %v", err)
+	}
+	unaryDone.Fire()
+	if chErr, err := readerErrCh.Receive(ctx); chErr != nil || err != nil {
+		if err != nil {
+			t.Fatalf("Should have received something from error channel: %v", err)
+		}
+		if chErr != nil {
+			t.Fatalf("Should have received a nil error from channel, instead received: %v", chErr)
+		}
+	}
+}
+
+// TestLoggingLinkedWithTraceServerSide tests that server side logs get the
+// trace and span id corresponding to the created Server Span for the RPC.
+func (s) TestLoggingLinkedWithTraceServerSide(t *testing.T) {
+	fle := &fakeLoggingExporter{
+		t: t,
+	}
+	oldNewLoggingExporter := newLoggingExporter
+	defer func() {
+		newLoggingExporter = oldNewLoggingExporter
+	}()
+
+	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+		return fle, nil
+	}
+
+	idCh := testutils.NewChannel()
+
+	fe := &fakeOpenCensusExporter{
+		t:    t,
+		idCh: idCh,
+	}
+	oldNewExporter := newExporter
+	defer func() {
+		newExporter = oldNewExporter
+	}()
+
+	newExporter = func(config *config) (tracingMetricsExporter, error) {
+		return fe, nil
+	}
+
+	const projectID = "project-id"
+	tracesAndLogsConfig := &config{
+		ProjectID: projectID,
+		CloudLogging: &cloudLogging{
+			ServerRPCEvents: []serverRPCEvents{
+				{
+					Methods:          []string{"*"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+		CloudTrace: &cloudTrace{
+			SamplingRate: 1.0,
+		},
+	}
+	cleanup, err := setupObservabilitySystemWithConfig(tracesAndLogsConfig)
+	if err != nil {
+		t.Fatalf("error setting up observability %v", err)
+	}
+	defer cleanup()
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+			return &grpc_testing.SimpleResponse{}, nil
+		},
+		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+			_, err := stream.Recv()
+			if err != io.EOF {
+				return err
+			}
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	// Spawn a goroutine to receive the trace and span ids received by the
+	// exporter corresponding to a Unary RPC.
+	readerErrCh := testutils.NewChannel()
+	unaryDone := grpcsync.NewEvent()
+	go func() {
+		var traceAndSpanIDs []traceAndSpanID
+		val, err := idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok := val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+		<-unaryDone.Done()
+		var tasiServer traceAndSpanIDString
+		for _, tasi := range traceAndSpanIDs {
+			if strings.HasPrefix(tasi.spanName, "grpc.") {
+				tasiServer = tasi.idsToString(projectID)
+				continue
+			}
+		}
+
+		fle.mu.Lock()
+		for _, tasiSeen := range fle.idsSeen {
+			if diff := cmp.Diff(tasiSeen, &tasiServer, cmp.AllowUnexported(traceAndSpanIDString{})); diff != "" {
+				readerErrCh.Send(errors.New("got unexpected id, should be a server span"))
+			}
+		}
+
+		fle.entries = nil
+		fle.mu.Unlock()
+		readerErrCh.Send(nil)
+	}()
+	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: testOkPayload}}); err != nil {
+		t.Fatalf("Unexpected error from UnaryCall: %v", err)
+	}
+	unaryDone.Fire()
+	if chErr, err := readerErrCh.Receive(ctx); chErr != nil || err != nil {
+		if err != nil {
+			t.Fatalf("Should have received something from error channel: %v", err)
+		}
+		if chErr != nil {
+			t.Fatalf("Should have received a nil error from channel, instead received: %v", chErr)
+		}
+	}
+}
+
+// TestLoggingLinkedWithTrace tests that client and server side logs get the
+// trace and span id corresponding to either the Call Level Span or Server Span
+// (no determinism, so can only assert one or the other), for Unary and
+// Streaming RPCs.
+func (s) TestLoggingLinkedWithTrace(t *testing.T) {
+	fle := &fakeLoggingExporter{
+		t: t,
+	}
+	oldNewLoggingExporter := newLoggingExporter
+	defer func() {
+		newLoggingExporter = oldNewLoggingExporter
+	}()
+
+	newLoggingExporter = func(ctx context.Context, config *config) (loggingExporter, error) {
+		return fle, nil
+	}
+
+	idCh := testutils.NewChannel()
+
+	fe := &fakeOpenCensusExporter{
+		t:    t,
+		idCh: idCh,
+	}
+	oldNewExporter := newExporter
+	defer func() {
+		newExporter = oldNewExporter
+	}()
+
+	newExporter = func(config *config) (tracingMetricsExporter, error) {
+		return fe, nil
+	}
+
+	const projectID = "project-id"
+	tracesAndLogsConfig := &config{
+		ProjectID: projectID,
+		CloudLogging: &cloudLogging{
+			ClientRPCEvents: []clientRPCEvents{
+				{
+					Methods:          []string{"*"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+			ServerRPCEvents: []serverRPCEvents{
+				{
+					Methods:          []string{"*"},
+					MaxMetadataBytes: 30,
+					MaxMessageBytes:  30,
+				},
+			},
+		},
+		CloudTrace: &cloudTrace{
+			SamplingRate: 1.0,
+		},
+	}
+	cleanup, err := setupObservabilitySystemWithConfig(tracesAndLogsConfig)
+	if err != nil {
+		t.Fatalf("error setting up observability %v", err)
+	}
+	defer cleanup()
+	ss := &stubserver.StubServer{
+		UnaryCallF: func(ctx context.Context, in *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+			return &grpc_testing.SimpleResponse{}, nil
+		},
+		FullDuplexCallF: func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+			_, err := stream.Recv()
+			if err != io.EOF {
+				return err
+			}
+			return nil
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	// Spawn a goroutine to receive the trace and span ids received by the
+	// exporter corresponding to a Unary RPC.
+	readerErrCh := testutils.NewChannel()
+	unaryDone := grpcsync.NewEvent()
+	go func() {
+		var traceAndSpanIDs []traceAndSpanID
+		val, err := idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok := val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+		<-unaryDone.Done()
+		var tasiSent traceAndSpanIDString
+		var tasiServer traceAndSpanIDString
+		for _, tasi := range traceAndSpanIDs {
+			if strings.HasPrefix(tasi.spanName, "Sent.") {
+				tasiSent = tasi.idsToString(projectID)
+				continue
+			}
+			if strings.HasPrefix(tasi.spanName, "grpc.") {
+				tasiServer = tasi.idsToString(projectID)
+			}
+		}
+
+		fle.mu.Lock()
+		for _, tasiSeen := range fle.idsSeen {
+			if diff := cmp.Diff(tasiSeen, &tasiSent, cmp.AllowUnexported(traceAndSpanIDString{})); diff != "" {
+				if diff2 := cmp.Diff(tasiSeen, &tasiServer, cmp.AllowUnexported(traceAndSpanIDString{})); diff2 != "" {
+					readerErrCh.Send(errors.New("got unexpected id, should be client or server span"))
+				}
+			}
+		}
+
+		fle.entries = nil
+		fle.mu.Unlock()
+		readerErrCh.Send(nil)
+	}()
+	if _, err := ss.Client.UnaryCall(ctx, &grpc_testing.SimpleRequest{Payload: &grpc_testing.Payload{Body: testOkPayload}}); err != nil {
+		t.Fatalf("Unexpected error from UnaryCall: %v", err)
+	}
+	unaryDone.Fire()
+	if chErr, err := readerErrCh.Receive(ctx); chErr != nil || err != nil {
+		if err != nil {
+			t.Fatalf("Should have received something from error channel: %v", err)
+		}
+		if chErr != nil {
+			t.Fatalf("Should have received a nil error from channel, instead received: %v", chErr)
+		}
+	}
+
+	fle.mu.Lock()
+	fle.idsSeen = nil
+	fle.mu.Unlock()
+
+	// Test streaming. Spawn a goroutine to receive the trace and span ids
+	// received by the exporter corresponding to a streaming RPC.
+	readerErrCh = testutils.NewChannel()
+	streamDone := grpcsync.NewEvent()
+	go func() {
+		var traceAndSpanIDs []traceAndSpanID
+
+		val, err := idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok := val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+
+		val, err = idCh.Receive(ctx)
+		if err != nil {
+			readerErrCh.Send(fmt.Errorf("error while waiting for IDs: %v", err))
+		}
+		tasi, ok = val.(traceAndSpanID)
+		if !ok {
+			readerErrCh.Send(fmt.Errorf("received wrong type from channel: %T", val))
+		}
+		traceAndSpanIDs = append(traceAndSpanIDs, tasi)
+		<-streamDone.Done()
+		var tasiSent traceAndSpanIDString
+		var tasiServer traceAndSpanIDString
+		for _, tasi := range traceAndSpanIDs {
+			if strings.HasPrefix(tasi.spanName, "Sent.") {
+				tasiSent = tasi.idsToString(projectID)
+				continue
+			}
+			if strings.HasPrefix(tasi.spanName, "grpc.") {
+				tasiServer = tasi.idsToString(projectID)
+			}
+		}
+
+		fle.mu.Lock()
+		for _, tasiSeen := range fle.idsSeen {
+			if diff := cmp.Diff(tasiSeen, &tasiSent, cmp.AllowUnexported(traceAndSpanIDString{})); diff != "" {
+				if diff2 := cmp.Diff(tasiSeen, &tasiServer, cmp.AllowUnexported(traceAndSpanIDString{})); diff2 != "" {
+					readerErrCh.Send(errors.New("got unexpected id, should be client or server span"))
+				}
+			}
+		}
+
+		fle.entries = nil
+		fle.mu.Unlock()
+		readerErrCh.Send(nil)
+	}()
+
+	stream, err := ss.Client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("ss.Client.FullDuplexCall failed: %f", err)
+	}
+
+	stream.CloseSend()
+	if _, err = stream.Recv(); err != io.EOF {
+		t.Fatalf("unexpected error: %v, expected an EOF error", err)
+	}
+	streamDone.Fire()
+
+	if chErr, err := readerErrCh.Receive(ctx); chErr != nil || err != nil {
+		if err != nil {
+			t.Fatalf("Should have received something from error channel: %v", err)
+		}
+		if chErr != nil {
+			t.Fatalf("Should have received a nil error from channel, instead received: %v", chErr)
+		}
 	}
 }

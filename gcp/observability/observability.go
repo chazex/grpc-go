@@ -19,7 +19,7 @@
 // Package observability implements the tracing, metrics, and logging data
 // collection, and provides controlling knobs via a config file.
 //
-// Experimental
+// # Experimental
 //
 // Notice: This package is EXPERIMENTAL and may be changed or removed in a
 // later release.
@@ -33,10 +33,6 @@ import (
 )
 
 var logger = grpclog.Component("observability")
-
-func init() {
-	prepareLogging()
-}
 
 // Start is the opt-in API for gRPC Observability plugin. This function should
 // be invoked in the main function, and before creating any gRPC clients or
@@ -55,21 +51,33 @@ func Start(ctx context.Context) error {
 		return err
 	}
 	if config == nil {
-		return fmt.Errorf("no ObservabilityConfig found, it can be set via env %s", envObservabilityConfig)
+		return fmt.Errorf("no ObservabilityConfig found")
 	}
 
 	// Set the project ID if it isn't configured manually.
-	if err := ensureProjectIDInObservabilityConfig(ctx, config); err != nil {
+	if err = ensureProjectIDInObservabilityConfig(ctx, config); err != nil {
 		return err
 	}
 
+	// Cleanup any created resources this function created in case this function
+	// errors.
+	defer func() {
+		if err != nil {
+			End()
+		}
+	}()
+
 	// Enabling tracing and metrics via OpenCensus
-	if err := startOpenCensus(config, nil); err != nil {
+	if err = startOpenCensus(config); err != nil {
 		return fmt.Errorf("failed to instrument OpenCensus: %v", err)
 	}
 
+	if err = startLogging(ctx, config); err != nil {
+		return fmt.Errorf("failed to start logging: %v", err)
+	}
+
 	// Logging is controlled by the config at methods level.
-	return defaultLogger.Start(ctx, config)
+	return nil
 }
 
 // End is the clean-up API for gRPC Observability plugin. It is expected to be
@@ -79,5 +87,6 @@ func Start(ctx context.Context) error {
 //
 // Note: this method should only be invoked once.
 func End() {
-	defaultLogger.Close()
+	stopLogging()
+	stopOpenCensus()
 }

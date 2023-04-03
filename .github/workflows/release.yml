@@ -6,13 +6,16 @@ on:
 
 jobs:
   release:
+    permissions:
+      contents: write # to upload release asset (actions/upload-release-asset)
+
     name: Release cmd/protoc-gen-go-grpc
     runs-on: ubuntu-latest
     if: startsWith(github.event.release.tag_name, 'cmd/protoc-gen-go-grpc/')
     strategy:
       matrix:
         goos: [linux, darwin, windows]
-        goarch: [386, amd64]
+        goarch: [386, amd64, arm64]
         exclude:
           - goos: darwin
             goarch: 386

@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/channelz"
+	istatus "google.golang.org/grpc/internal/status"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/status"
 )
@@ -59,12 +60,18 @@ func (pw *pickerWrapper) updatePicker(p balancer.Picker) {
 	pw.mu.Unlock()
 }
 
-func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) func(balancer.DoneInfo) {
+// doneChannelzWrapper performs the following:
+//   - increments the calls started channelz counter
+//   - wraps the done function in the passed in result to increment the calls
+//     failed or calls succeeded channelz counter before invoking the actual
+//     done function.
+func doneChannelzWrapper(acw *acBalancerWrapper, result *balancer.PickResult) {
 	acw.mu.Lock()
 	ac := acw.ac
 	acw.mu.Unlock()
 	ac.incrCallsStarted()
-	return func(b balancer.DoneInfo) {
+	done := result.Done
+	result.Done = func(b balancer.DoneInfo) {
 		if b.Err != nil && b.Err != io.EOF {
 			ac.incrCallsFailed()
 		} else {
@@ -85,7 +92,7 @@ func doneChannelzWrapper(acw *acBalancerWrapper, done func(balancer.DoneInfo)) f
 // - the current picker returns other errors and failfast is false.
 // - the subConn returned by the current picker is not READY
 // When one of these situations happens, pick blocks until the picker gets updated.
-func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.PickInfo) (transport.ClientTransport, func(balancer.DoneInfo), error) {
+func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.PickInfo) (transport.ClientTransport, balancer.PickResult, error) {
 	var ch chan struct{}
 
 	var lastPickErr error
@@ -93,7 +100,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 		pw.mu.Lock()
 		if pw.done {
 			pw.mu.Unlock()
-			return nil, nil, ErrClientConnClosing
+			return nil, balancer.PickResult{}, ErrClientConnClosing
 		}
 
 		if pw.picker == nil {
@@ -114,9 +121,9 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 				}
 				switch ctx.Err() {
 				case context.DeadlineExceeded:
-					return nil, nil, status.Error(codes.DeadlineExceeded, errStr)
+					return nil, balancer.PickResult{}, status.Error(codes.DeadlineExceeded, errStr)
 				case context.Canceled:
-					return nil, nil, status.Error(codes.Canceled, errStr)
+					return nil, balancer.PickResult{}, status.Error(codes.Canceled, errStr)
 				}
 			case <-ch:
 				// 如果没有picker，则在这里阻塞(这个应该是出现在初始化的时候)。
@@ -132,14 +139,17 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 
 		// 拿到SubConn
 		pickResult, err := p.Pick(info)
-
 		if err != nil {
 			if err == balancer.ErrNoSubConnAvailable {
 				continue
 			}
-			if _, ok := status.FromError(err); ok {
+			if st, ok := status.FromError(err); ok {
 				// Status error: end the RPC unconditionally with this status.
-				return nil, nil, dropError{error: err}
+				// First restrict the code to the list allowed by gRFC A54.
+				if istatus.IsRestrictedControlPlaneCode(st) {
+					err = status.Errorf(codes.Internal, "received picker error with illegal status: %v", err)
+				}
+				return nil, balancer.PickResult{}, dropError{error: err}
 			}
 			// For all other errors, wait for ready RPCs should block and other
 			// RPCs should fail with unavailable.
@@ -147,7 +157,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 				lastPickErr = err
 				continue
 			}
-			return nil, nil, status.Error(codes.Unavailable, err.Error())
+			return nil, balancer.PickResult{}, status.Error(codes.Unavailable, err.Error())
 		}
 
 		acw, ok := pickResult.SubConn.(*acBalancerWrapper)
@@ -157,10 +167,11 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
 		}
 		if t := acw.getAddrConn().getReadyTransport(); t != nil {
 			if channelz.IsOn() {
-				return t, doneChannelzWrapper(acw, pickResult.Done), nil
+				doneChannelzWrapper(acw, &pickResult)
+				return t, pickResult, nil
 			}
 			// 成功拿到http2连接，函数返回
-			return t, pickResult.Done, nil
+			return t, pickResult, nil
 		}
 		if pickResult.Done != nil {
 			// Calling done with nil error, no bytes sent and no bytes received.

@@ -1,3 +1,6 @@
+// TODO(@gregorycooke) - Remove when only golang 1.19+ is supported
+//go:build go1.19
+
 /*
  *
  * Copyright 2021 gRPC authors.
@@ -30,7 +33,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -83,7 +86,7 @@ func (s RevocationStatus) String() string {
 // certificateListExt contains a pkix.CertificateList and parsed
 // extensions that aren't provided by the golang CRL parser.
 type certificateListExt struct {
-	CertList *pkix.CertificateList
+	CertList *x509.RevocationList
 	// RFC5280, 5.2.1, all conforming CRLs must have a AKID with the ID method.
 	AuthorityKeyID []byte
 	RawIssuer      []byte
@@ -150,12 +153,12 @@ func x509NameHash(r pkix.RDNSequence) string {
 
 // CheckRevocation checks the connection for revoked certificates based on RFC5280.
 // This implementation has the following major limitations:
-// 	* Indirect CRL files are not supported.
-// 	* CRL loading is only supported from directories in the X509_LOOKUP_hash_dir format.
-// 	* OnlySomeReasons is not supported.
-// 	* Delta CRL files are not supported.
-// 	* Certificate CRLDistributionPoint must be URLs, but are then ignored and converted into a file path.
-// 	* CRL checks are done after path building, which goes against RFC4158.
+//   - Indirect CRL files are not supported.
+//   - CRL loading is only supported from directories in the X509_LOOKUP_hash_dir format.
+//   - OnlySomeReasons is not supported.
+//   - Delta CRL files are not supported.
+//   - Certificate CRLDistributionPoint must be URLs, but are then ignored and converted into a file path.
+//   - CRL checks are done after path building, which goes against RFC4158.
 func CheckRevocation(conn tls.ConnectionState, cfg RevocationConfig) error {
 	return CheckChainRevocation(conn.VerifiedChains, cfg)
 }
@@ -222,7 +225,7 @@ func cachedCrl(rawIssuer []byte, cache Cache) (*certificateListExt, bool) {
 		return nil, false
 	}
 	// If the CRL is expired, force a reload.
-	if crl.CertList.HasExpired(time.Now()) {
+	if hasExpired(crl.CertList, time.Now()) {
 		return nil, false
 	}
 	return crl, true
@@ -238,11 +241,11 @@ func fetchIssuerCRL(rawIssuer []byte, crlVerifyCrt []*x509.Certificate, cfg Revo
 
 	crl, err := fetchCRL(rawIssuer, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("fetchCRL() failed err = %v", err)
+		return nil, fmt.Errorf("fetchCRL() failed: %v", err)
 	}
 
 	if err := verifyCRL(crl, rawIssuer, crlVerifyCrt); err != nil {
-		return nil, fmt.Errorf("verifyCRL() failed err = %v", err)
+		return nil, fmt.Errorf("verifyCRL() failed: %v", err)
 	}
 	if cfg.Cache != nil {
 		cfg.Cache.Add(hex.EncodeToString(rawIssuer), crl)
@@ -264,7 +267,7 @@ func checkCert(c *x509.Certificate, crlVerifyCrt []*x509.Certificate, cfg Revoca
 	}
 	revocation, err := checkCertRevocation(c, crl)
 	if err != nil {
-		grpclogLogger.Warningf("checkCertRevocation(CRL %v) failed %v", crl.CertList.TBSCertList.Issuer, err)
+		grpclogLogger.Warningf("checkCertRevocation(CRL %v) failed: %v", crl.CertList.Issuer, err)
 		// We couldn't check the CRL file for some reason, so we don't know if it's RevocationUnrevoked or not.
 		return RevocationUndetermined
 	}
@@ -280,7 +283,7 @@ func checkCertRevocation(c *x509.Certificate, crl *certificateListExt) (Revocati
 	rawEntryIssuer := crl.RawIssuer
 
 	// Loop through all the revoked certificates.
-	for _, revCert := range crl.CertList.TBSCertList.RevokedCertificates {
+	for _, revCert := range crl.CertList.RevokedCertificates {
 		// 5.3 Loop through CRL entry extensions for needed information.
 		for _, ext := range revCert.Extensions {
 			if oidCertificateIssuer.Equal(ext.Id) {
@@ -317,7 +320,7 @@ func parseCertIssuerExt(ext pkix.Extension) ([]byte, error) {
 	// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
 	var generalNames []asn1.RawValue
 	if rest, err := asn1.Unmarshal(ext.Value, &generalNames); err != nil || len(rest) != 0 {
-		return nil, fmt.Errorf("asn1.Unmarshal failed err = %v", err)
+		return nil, fmt.Errorf("asn1.Unmarshal failed: %v", err)
 	}
 
 	for _, generalName := range generalNames {
@@ -359,8 +362,8 @@ type authKeyID struct {
 // 		indirectCRL                [4] BOOLEAN DEFAULT FALSE,
 // 		onlyContainsAttributeCerts [5] BOOLEAN DEFAULT FALSE }
 
-// 		-- at most one of onlyContainsUserCerts, onlyContainsCACerts,
-// 		-- and onlyContainsAttributeCerts may be set to TRUE.
+// -- at most one of onlyContainsUserCerts, onlyContainsCACerts,
+// -- and onlyContainsAttributeCerts may be set to TRUE.
 type issuingDistributionPoint struct {
 	DistributionPoint          asn1.RawValue  `asn1:"optional,tag:0"`
 	OnlyContainsUserCerts      bool           `asn1:"optional,tag:1"`
@@ -372,13 +375,13 @@ type issuingDistributionPoint struct {
 
 // parseCRLExtensions parses the extensions for a CRL
 // and checks that they're supported by the parser.
-func parseCRLExtensions(c *pkix.CertificateList) (*certificateListExt, error) {
+func parseCRLExtensions(c *x509.RevocationList) (*certificateListExt, error) {
 	if c == nil {
 		return nil, errors.New("c is nil, expected any value")
 	}
 	certList := &certificateListExt{CertList: c}
 
-	for _, ext := range c.TBSCertList.Extensions {
+	for _, ext := range c.Extensions {
 		switch {
 		case oidDeltaCRLIndicator.Equal(ext.Id):
 			return nil, fmt.Errorf("delta CRLs unsupported")
@@ -386,7 +389,7 @@ func parseCRLExtensions(c *pkix.CertificateList) (*certificateListExt, error) {
 		case oidAuthorityKeyIdentifier.Equal(ext.Id):
 			var a authKeyID
 			if rest, err := asn1.Unmarshal(ext.Value, &a); err != nil {
-				return nil, fmt.Errorf("asn1.Unmarshal failed. err = %v", err)
+				return nil, fmt.Errorf("asn1.Unmarshal failed: %v", err)
 			} else if len(rest) != 0 {
 				return nil, errors.New("trailing data after AKID extension")
 			}
@@ -395,7 +398,7 @@ func parseCRLExtensions(c *pkix.CertificateList) (*certificateListExt, error) {
 		case oidIssuingDistributionPoint.Equal(ext.Id):
 			var dp issuingDistributionPoint
 			if rest, err := asn1.Unmarshal(ext.Value, &dp); err != nil {
-				return nil, fmt.Errorf("asn1.Unmarshal failed. err = %v", err)
+				return nil, fmt.Errorf("asn1.Unmarshal failed: %v", err)
 			} else if len(rest) != 0 {
 				return nil, errors.New("trailing data after IssuingDistributionPoint extension")
 			}
@@ -431,24 +434,24 @@ func fetchCRL(rawIssuer []byte, cfg RevocationConfig) (*certificateListExt, erro
 		var r pkix.RDNSequence
 		rest, err := asn1.Unmarshal(rawIssuer, &r)
 		if len(rest) != 0 || err != nil {
-			return nil, fmt.Errorf("asn1.Unmarshal(Issuer) len(rest) = %v, err = %v", len(rest), err)
+			return nil, fmt.Errorf("asn1.Unmarshal(Issuer) len(rest) = %d failed: %v", len(rest), err)
 		}
 		crlPath := fmt.Sprintf("%s.r%d", filepath.Join(cfg.RootDir, x509NameHash(r)), i)
-		crlBytes, err := ioutil.ReadFile(crlPath)
+		crlBytes, err := os.ReadFile(crlPath)
 		if err != nil {
 			// Break when we can't read a CRL file.
 			grpclogLogger.Infof("readFile: %v", err)
 			break
 		}
 
-		crl, err := x509.ParseCRL(crlBytes)
+		crl, err := parseRevocationList(crlBytes)
 		if err != nil {
 			// Parsing errors for a CRL shouldn't happen so fail.
-			return nil, fmt.Errorf("x509.ParseCrl(%v) failed err = %v", crlPath, err)
+			return nil, fmt.Errorf("parseRevocationList(%v) failed: %v", crlPath, err)
 		}
 		var certList *certificateListExt
 		if certList, err = parseCRLExtensions(crl); err != nil {
-			grpclogLogger.Infof("fetchCRL: unsupported crl %v, err = %v", crlPath, err)
+			grpclogLogger.Infof("fetchCRL: unsupported crl %v: %v", crlPath, err)
 			// Continue to find a supported CRL
 			continue
 		}
@@ -486,25 +489,32 @@ func verifyCRL(crl *certificateListExt, rawIssuer []byte, chain []*x509.Certific
 		// So, this is much simpler than RFC4158 and should be compatible.
 		if bytes.Equal(c.SubjectKeyId, crl.AuthorityKeyID) && bytes.Equal(c.RawSubject, crl.RawIssuer) {
 			// RFC5280, 6.3.3 (g) Validate signature.
-			return c.CheckCRLSignature(crl.CertList)
+			return crl.CertList.CheckSignatureFrom(c)
 		}
 	}
-	return fmt.Errorf("verifyCRL: No certificates mached CRL issuer (%v)", crl.CertList.TBSCertList.Issuer)
+	return fmt.Errorf("verifyCRL: No certificates mached CRL issuer (%v)", crl.CertList.Issuer)
 }
 
+// pemType is the type of a PEM encoded CRL.
+const pemType string = "X509 CRL"
+
 var crlPemPrefix = []byte("-----BEGIN X509 CRL")
+
+func crlPemToDer(crlBytes []byte) []byte {
+	block, _ := pem.Decode(crlBytes)
+	if block != nil && block.Type == pemType {
+		crlBytes = block.Bytes
+	}
+	return crlBytes
+}
 
 // extractCRLIssuer extracts the raw ASN.1 encoding of the CRL issuer. Due to the design of
 // pkix.CertificateList and pkix.RDNSequence, it is not possible to reliably marshal the
 // parsed Issuer to it's original raw encoding.
 func extractCRLIssuer(crlBytes []byte) ([]byte, error) {
 	if bytes.HasPrefix(crlBytes, crlPemPrefix) {
-		block, _ := pem.Decode(crlBytes)
-		if block != nil && block.Type == "X509 CRL" {
-			crlBytes = block.Bytes
-		}
+		crlBytes = crlPemToDer(crlBytes)
 	}
-
 	der := cryptobyte.String(crlBytes)
 	var issuer cryptobyte.String
 	if !der.ReadASN1(&der, cbasn1.SEQUENCE) ||
@@ -515,4 +525,24 @@ func extractCRLIssuer(crlBytes []byte) ([]byte, error) {
 		return nil, errors.New("extractCRLIssuer: invalid ASN.1 encoding")
 	}
 	return issuer, nil
+}
+
+func hasExpired(crl *x509.RevocationList, now time.Time) bool {
+	return !now.Before(crl.NextUpdate)
+}
+
+// parseRevocationList comes largely from here
+// x509.go:
+// https://github.com/golang/go/blob/e2f413402527505144beea443078649380e0c545/src/crypto/x509/x509.go#L1669-L1690
+// We must first convert PEM to DER to be able to use the new
+// x509.ParseRevocationList instead of the deprecated x509.ParseCRL
+func parseRevocationList(crlBytes []byte) (*x509.RevocationList, error) {
+	if bytes.HasPrefix(crlBytes, crlPemPrefix) {
+		crlBytes = crlPemToDer(crlBytes)
+	}
+	crl, err := x509.ParseRevocationList(crlBytes)
+	if err != nil {
+		return nil, err
+	}
+	return crl, nil
 }

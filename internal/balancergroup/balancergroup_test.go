@@ -67,13 +67,6 @@ func Test(t *testing.T) {
 	grpctest.RunSubTests(t, s{})
 }
 
-func subConnFromPicker(p balancer.Picker) func() balancer.SubConn {
-	return func() balancer.SubConn {
-		scst, _ := p.Pick(balancer.PickInfo{})
-		return scst.SubConn
-	}
-}
-
 // Create a new balancer group, add balancer and backends, but not start.
 // - b1, weight 2, backends [0,1]
 // - b2, weight 1, backends [2,3]
@@ -116,7 +109,7 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 		m1[testBackendAddrs[1]], m1[testBackendAddrs[1]],
 		m1[testBackendAddrs[2]], m1[testBackendAddrs[3]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p1)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 
@@ -158,7 +151,7 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 		m2[testBackendAddrs[3]], m2[testBackendAddrs[3]], m2[testBackendAddrs[3]],
 		m2[testBackendAddrs[1]], m2[testBackendAddrs[2]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p2)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p2)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 }
@@ -167,8 +160,9 @@ func (s) TestBalancerGroup_start_close(t *testing.T) {
 // into balancer group inline when it gets an update.
 //
 // The potential deadlock can happen if we
-//  - hold a lock and send updates to balancer (e.g. update resolved addresses)
-//  - the balancer calls back (NewSubConn or update picker) in line
+//   - hold a lock and send updates to balancer (e.g. update resolved addresses)
+//   - the balancer calls back (NewSubConn or update picker) in line
+//
 // The callback will try to hold hte same lock again, which will cause a
 // deadlock.
 //
@@ -240,13 +234,12 @@ func initBalancerGroupForCachingTest(t *testing.T) (*weightedaggregator.Aggregat
 		m1[testBackendAddrs[1]], m1[testBackendAddrs[1]],
 		m1[testBackendAddrs[2]], m1[testBackendAddrs[3]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p1)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 
 	gator.Remove(testBalancerIDs[1])
 	bg.Remove(testBalancerIDs[1])
-	gator.BuildAndUpdate()
 	// Don't wait for SubConns to be removed after close, because they are only
 	// removed after close timeout.
 	for i := 0; i < 10; i++ {
@@ -262,7 +255,7 @@ func initBalancerGroupForCachingTest(t *testing.T) (*weightedaggregator.Aggregat
 	want = []balancer.SubConn{
 		m1[testBackendAddrs[0]], m1[testBackendAddrs[1]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p2)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p2)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 
@@ -303,7 +296,7 @@ func (s) TestBalancerGroup_locality_caching(t *testing.T) {
 		// addr2 is down, b2 only has addr3 in READY state.
 		addrToSC[testBackendAddrs[3]], addrToSC[testBackendAddrs[3]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p3)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p3)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 
@@ -374,9 +367,17 @@ func (s) TestBalancerGroup_locality_caching_not_readd_within_timeout(t *testing.
 	}
 }
 
-// Wrap the rr builder, so it behaves the same, but has a different pointer.
+// Wrap the rr builder, so it behaves the same, but has a different name.
 type noopBalancerBuilderWrapper struct {
 	balancer.Builder
+}
+
+func init() {
+	balancer.Register(&noopBalancerBuilderWrapper{Builder: rrBuilder})
+}
+
+func (*noopBalancerBuilderWrapper) Name() string {
+	return "noopBalancerBuilderWrapper"
 }
 
 // After removing a sub-balancer, re-add with same ID, but different balancer
@@ -443,7 +444,7 @@ func (s) TestBalancerGroup_locality_caching_readd_with_different_builder(t *test
 		addrToSC[testBackendAddrs[1]], addrToSC[testBackendAddrs[1]],
 		addrToSC[testBackendAddrs[4]], addrToSC[testBackendAddrs[5]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p3)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p3)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 }
@@ -574,7 +575,7 @@ func (s) TestBalancerGracefulSwitch(t *testing.T) {
 	want := []balancer.SubConn{
 		m1[testBackendAddrs[0]], m1[testBackendAddrs[1]],
 	}
-	if err := testutils.IsRoundRobin(want, subConnFromPicker(p1)); err != nil {
+	if err := testutils.IsRoundRobin(want, testutils.SubConnFromPicker(p1)); err != nil {
 		t.Fatalf("want %v, got %v", want, err)
 	}
 

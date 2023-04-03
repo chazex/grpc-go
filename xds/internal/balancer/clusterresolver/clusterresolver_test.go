@@ -30,8 +30,6 @@ import (
 	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/balancer/weightedtarget"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/internal"
-	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpctest"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/internal/testutils"
@@ -43,14 +41,12 @@ import (
 	"google.golang.org/grpc/xds/internal/testutils/fakeclient"
 	"google.golang.org/grpc/xds/internal/xdsclient"
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
-
-	_ "google.golang.org/grpc/xds/internal/xdsclient/controller/version/v2" // V2 client registration.
 )
 
 const (
-	defaultTestTimeout      = 1 * time.Second
+	defaultTestTimeout      = 5 * time.Second
 	defaultTestShortTimeout = 10 * time.Millisecond
-	testEDSServcie          = "test-eds-service-name"
+	testEDSService          = "test-eds-service-name"
 	testClusterName         = "test-cluster-name"
 	testClusterName2        = "google_cfe_some-name"
 )
@@ -108,7 +104,7 @@ func (t *noopTestClientConn) NewSubConn([]resolver.Address, balancer.NewSubConnO
 	return nil, nil
 }
 
-func (noopTestClientConn) Target() string { return testEDSServcie }
+func (noopTestClientConn) Target() string { return testEDSService }
 
 type scStateChange struct {
 	sc    balancer.SubConn
@@ -151,22 +147,6 @@ func (f *fakeChildBalancer) waitForClientConnStateChangeVerifyBalancerConfig(ctx
 	return nil
 }
 
-func (f *fakeChildBalancer) waitForClientConnStateChange(ctx context.Context) error {
-	_, err := f.clientConnState.Receive(ctx)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (f *fakeChildBalancer) waitForResolverError(ctx context.Context) error {
-	_, err := f.resolverError.Receive(ctx)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 func (f *fakeChildBalancer) waitForSubConnStateChange(ctx context.Context, wantState *scStateChange) error {
 	val, err := f.subConnState.Receive(ctx)
 	if err != nil {
@@ -192,6 +172,9 @@ type fakeSubConn struct{}
 
 func (*fakeSubConn) UpdateAddresses([]resolver.Address) { panic("implement me") }
 func (*fakeSubConn) Connect()                           { panic("implement me") }
+func (*fakeSubConn) GetOrBuildProducer(balancer.ProducerBuilder) (balancer.Producer, func()) {
+	panic("implement me")
+}
 
 // waitForNewChildLB makes sure that a new child LB is created by the top-level
 // clusterResolverBalancer.
@@ -216,10 +199,7 @@ func setup(childLBCh *testutils.Channel) (*fakeclient.Client, func()) {
 		defer func() { childLBCh.Send(childLB) }()
 		return childLB
 	}
-	return xdsC, func() {
-		newChildBalancer = origNewChildBalancer
-		xdsC.Close()
-	}
+	return xdsC, func() { newChildBalancer = origNewChildBalancer }
 }
 
 // TestSubConnStateChange verifies if the top-level clusterResolverBalancer passes on
@@ -238,7 +218,7 @@ func (s) TestSubConnStateChange(t *testing.T) {
 
 	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
 		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDS(testEDSServcie),
+		BalancerConfig: newLBConfigWithOneEDS(testEDSService),
 	}); err != nil {
 		t.Fatalf("edsB.UpdateClientConnState() failed: %v", err)
 	}
@@ -259,178 +239,6 @@ func (s) TestSubConnStateChange(t *testing.T) {
 	edsB.UpdateSubConnState(fsc, state)
 	if err := edsLB.waitForSubConnStateChange(ctx, &scStateChange{sc: fsc, state: state}); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// TestErrorFromXDSClientUpdate verifies that an error from xdsClient update is
-// handled correctly.
-//
-// If it's resource-not-found, watch will NOT be canceled, the EDS impl will
-// receive an empty EDS update, and new RPCs will fail.
-//
-// If it's connection error, nothing will happen. This will need to change to
-// handle fallback.
-func (s) TestErrorFromXDSClientUpdate(t *testing.T) {
-	edsLBCh := testutils.NewChannel()
-	xdsC, cleanup := setup(edsLBCh)
-	defer cleanup()
-
-	builder := balancer.Get(Name)
-	edsB := builder.Build(newNoopTestClientConn(), balancer.BuildOptions{})
-	if edsB == nil {
-		t.Fatalf("builder.Build(%s) failed and returned nil", Name)
-	}
-	defer edsB.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
-		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDS(testEDSServcie),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := xdsC.WaitForWatchEDS(ctx); err != nil {
-		t.Fatalf("xdsClient.WatchEndpoints failed with error: %v", err)
-	}
-	xdsC.InvokeWatchEDSCallback("", xdsresource.EndpointsUpdate{}, nil)
-	edsLB, err := waitForNewChildLB(ctx, edsLBCh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := edsLB.waitForClientConnStateChange(ctx); err != nil {
-		t.Fatalf("EDS impl got unexpected update: %v", err)
-	}
-
-	connectionErr := xdsresource.NewErrorf(xdsresource.ErrorTypeConnection, "connection error")
-	xdsC.InvokeWatchEDSCallback("", xdsresource.EndpointsUpdate{}, connectionErr)
-
-	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := xdsC.WaitForCancelEDSWatch(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("watch was canceled, want not canceled (timeout error)")
-	}
-
-	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if err := edsLB.waitForClientConnStateChange(sCtx); err != context.DeadlineExceeded {
-		t.Fatal(err)
-	}
-	if err := edsLB.waitForResolverError(ctx); err != nil {
-		t.Fatalf("want resolver error, got %v", err)
-	}
-
-	resourceErr := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "clusterResolverBalancer resource not found error")
-	xdsC.InvokeWatchEDSCallback("", xdsresource.EndpointsUpdate{}, resourceErr)
-	// Even if error is resource not found, watch shouldn't be canceled, because
-	// this is an EDS resource removed (and xds client actually never sends this
-	// error, but we still handles it).
-	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := xdsC.WaitForCancelEDSWatch(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("watch was canceled, want not canceled (timeout error)")
-	}
-	if err := edsLB.waitForClientConnStateChange(sCtx); err != context.DeadlineExceeded {
-		t.Fatal(err)
-	}
-	if err := edsLB.waitForResolverError(ctx); err != nil {
-		t.Fatalf("want resolver error, got %v", err)
-	}
-
-	// An update with the same service name should not trigger a new watch.
-	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
-		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDS(testEDSServcie),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := xdsC.WaitForWatchEDS(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("got unexpected new EDS watch")
-	}
-}
-
-// TestErrorFromResolver verifies that resolver errors are handled correctly.
-//
-// If it's resource-not-found, watch will be canceled, the EDS impl will receive
-// an empty EDS update, and new RPCs will fail.
-//
-// If it's connection error, nothing will happen. This will need to change to
-// handle fallback.
-func (s) TestErrorFromResolver(t *testing.T) {
-	edsLBCh := testutils.NewChannel()
-	xdsC, cleanup := setup(edsLBCh)
-	defer cleanup()
-
-	builder := balancer.Get(Name)
-	edsB := builder.Build(newNoopTestClientConn(), balancer.BuildOptions{})
-	if edsB == nil {
-		t.Fatalf("builder.Build(%s) failed and returned nil", Name)
-	}
-	defer edsB.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
-		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDS(testEDSServcie),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := xdsC.WaitForWatchEDS(ctx); err != nil {
-		t.Fatalf("xdsClient.WatchEndpoints failed with error: %v", err)
-	}
-	xdsC.InvokeWatchEDSCallback("", xdsresource.EndpointsUpdate{}, nil)
-	edsLB, err := waitForNewChildLB(ctx, edsLBCh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := edsLB.waitForClientConnStateChange(ctx); err != nil {
-		t.Fatalf("EDS impl got unexpected update: %v", err)
-	}
-
-	connectionErr := xdsresource.NewErrorf(xdsresource.ErrorTypeConnection, "connection error")
-	edsB.ResolverError(connectionErr)
-
-	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := xdsC.WaitForCancelEDSWatch(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("watch was canceled, want not canceled (timeout error)")
-	}
-
-	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if err := edsLB.waitForClientConnStateChange(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("eds impl got EDS resp, want timeout error")
-	}
-	if err := edsLB.waitForResolverError(ctx); err != nil {
-		t.Fatalf("want resolver error, got %v", err)
-	}
-
-	resourceErr := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "clusterResolverBalancer resource not found error")
-	edsB.ResolverError(resourceErr)
-	if _, err := xdsC.WaitForCancelEDSWatch(ctx); err != nil {
-		t.Fatalf("want watch to be canceled, waitForCancel failed: %v", err)
-	}
-	if err := edsLB.waitForClientConnStateChange(sCtx); err != context.DeadlineExceeded {
-		t.Fatal(err)
-	}
-	if err := edsLB.waitForResolverError(ctx); err != nil {
-		t.Fatalf("want resolver error, got %v", err)
-	}
-
-	// An update with the same service name should trigger a new watch, because
-	// the previous watch was canceled.
-	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
-		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDS(testEDSServcie),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := xdsC.WaitForWatchEDS(ctx); err != nil {
-		t.Fatalf("xdsClient.WatchEndpoints failed with error: %v", err)
 	}
 }
 
@@ -533,13 +341,6 @@ func newLBConfigWithOneEDSAndOutlierDetection(edsServiceName string, odCfg outli
 // Configuration sent downward should have a top level Outlier Detection Policy
 // for each priority.
 func (s) TestOutlierDetection(t *testing.T) {
-	oldOutlierDetection := envconfig.XDSOutlierDetection
-	envconfig.XDSOutlierDetection = true
-	internal.RegisterOutlierDetectionBalancerForTesting()
-	defer func() {
-		envconfig.XDSOutlierDetection = oldOutlierDetection
-	}()
-
 	edsLBCh := testutils.NewChannel()
 	xdsC, cleanup := setup(edsLBCh)
 	defer cleanup()
@@ -560,7 +361,7 @@ func (s) TestOutlierDetection(t *testing.T) {
 	// level.
 	if err := edsB.UpdateClientConnState(balancer.ClientConnState{
 		ResolverState:  xdsclient.SetClient(resolver.State{}, xdsC),
-		BalancerConfig: newLBConfigWithOneEDSAndOutlierDetection(testEDSServcie, noopODCfg),
+		BalancerConfig: newLBConfigWithOneEDSAndOutlierDetection(testEDSService, noopODCfg),
 	}); err != nil {
 		t.Fatal(err)
 	}

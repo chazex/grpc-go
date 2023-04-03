@@ -66,7 +66,9 @@ func (r *Resolver) Build(target resolver.Target, cc resolver.ClientConn, opts re
 }
 
 // ResolveNow resolver.Resolver interface
-func (r *Resolver) ResolveNow(o resolver.ResolveNowOptions) {}
+func (r *Resolver) ResolveNow(o resolver.ResolveNowOptions) {
+	log.Printf("[self.%s Resolver] 收到 ResolveNow 通知", etcdschema)
+}
 
 // Close resolver.Resolver interface
 func (r *Resolver) Close() {

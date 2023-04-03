@@ -20,7 +20,6 @@ package test
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,53 +31,16 @@ import (
 	"google.golang.org/grpc/internal/channelz"
 	imetadata "google.golang.org/grpc/internal/metadata"
 	"google.golang.org/grpc/internal/stubserver"
+	rrutil "google.golang.org/grpc/internal/testutils/roundrobin"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
+
 	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
 const rrServiceConfig = `{"loadBalancingConfig": [{"round_robin":{}}]}`
-
-func checkRoundRobin(ctx context.Context, cc *grpc.ClientConn, addrs []resolver.Address) error {
-	client := testgrpc.NewTestServiceClient(cc)
-	// Make sure connections to all backends are up.
-	backendCount := len(addrs)
-	for i := 0; i < backendCount; i++ {
-		for {
-			time.Sleep(time.Millisecond)
-			if ctx.Err() != nil {
-				return fmt.Errorf("timeout waiting for connection to %q to be up", addrs[i].Addr)
-			}
-			var peer peer.Peer
-			if _, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&peer)); err != nil {
-				// Some tests remove backends and check if round robin is happening
-				// across the remaining backends. In such cases, RPCs can initially fail
-				// on the connection using the removed backend. Just keep retrying and
-				// eventually the connection using the removed backend will shutdown and
-				// will be removed.
-				continue
-			}
-			if peer.Addr.String() == addrs[i].Addr {
-				break
-			}
-		}
-	}
-	// Make sure RPCs are sent to all backends.
-	for i := 0; i < 3*backendCount; i++ {
-		var peer peer.Peer
-		if _, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&peer)); err != nil {
-			return fmt.Errorf("EmptyCall() = %v, want <nil>", err)
-		}
-		if gotPeer, wantPeer := peer.Addr.String(), addrs[i%backendCount].Addr; gotPeer != wantPeer {
-			return fmt.Errorf("rpc sent to peer %q, want peer %q", gotPeer, wantPeer)
-		}
-	}
-	return nil
-}
 
 func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOption) (*grpc.ClientConn, *manual.Resolver, []*stubserver.StubServer) {
 	t.Helper()
@@ -128,7 +90,7 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 	}
 
 	r.UpdateState(resolver.State{Addresses: addrs})
-	if err := checkRoundRobin(ctx, cc, addrs); err != nil {
+	if err := rrutil.CheckRoundRobinRPCs(ctx, client, addrs); err != nil {
 		t.Fatal(err)
 	}
 	return cc, r, backends
@@ -246,7 +208,8 @@ func (s) TestRoundRobin_OneServerDown(t *testing.T) {
 	for i := 0; i < len(backends)-1; i++ {
 		addrs[i] = resolver.Address{Addr: backends[i].Address}
 	}
-	if err := checkRoundRobin(ctx, cc, addrs); err != nil {
+	client := testpb.NewTestServiceClient(cc)
+	if err := rrutil.CheckRoundRobinRPCs(ctx, client, addrs); err != nil {
 		t.Fatalf("RPCs are not being round robined across remaining servers: %v", err)
 	}
 }

@@ -23,7 +23,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"sync"
@@ -42,8 +41,6 @@ import (
 const (
 	// Default timeout for normal connections.
 	defaultTestTimeout = 5 * time.Second
-	// Default timeout for failed connections.
-	defaultTestShortTimeout = 10 * time.Millisecond
 	// Intervals that set to monitor the credential updates.
 	credRefreshingInterval = 200 * time.Millisecond
 	// Time we wait for the credential updates to be picked up.
@@ -308,7 +305,7 @@ func (s) TestEnd2End(t *testing.T) {
 		// The mutual authentication works at the beginning, since ClientCert1
 		// trusted by ServerTrust1, ServerCert1 by ClientTrust1, and also the
 		// custom verification check on server side allows all connections.
-		// At stage 1, server disallows the the connections by setting custom
+		// At stage 1, server disallows the connections by setting custom
 		// verification check. The following calls should fail. Previous
 		// connections should not be affected.
 		// At stage 2, server allows all the connections again and the
@@ -401,18 +398,19 @@ func (s) TestEnd2End(t *testing.T) {
 			}
 			// ------------------------Scenario 3------------------------------------
 			// stage = 1, new connection should fail
-			shortCtx, shortCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-			defer shortCancel()
-			conn2, greetClient, err := callAndVerifyWithClientConn(shortCtx, addr, "rpc call 3", clientTLSCreds, true)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), defaultTestTimeout)
+			conn2, _, err := callAndVerifyWithClientConn(ctx2, addr, "rpc call 3", clientTLSCreds, true)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer conn2.Close()
+			// Immediately cancel the context so the dialing won't drag the entire timeout still it stops.
+			cancel2()
 			// ----------------------------------------------------------------------
 			stage.increase()
 			// ------------------------Scenario 4------------------------------------
 			// stage = 2,  new connection should succeed
-			conn3, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 4", clientTLSCreds, false)
+			conn3, _, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 4", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -436,27 +434,27 @@ type tmpCredsFiles struct {
 func createTmpFiles() (*tmpCredsFiles, error) {
 	tmpFiles := &tmpCredsFiles{}
 	var err error
-	tmpFiles.clientCertTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.clientCertTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
-	tmpFiles.clientKeyTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.clientKeyTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
-	tmpFiles.clientTrustTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.clientTrustTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
-	tmpFiles.serverCertTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.serverCertTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
-	tmpFiles.serverKeyTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.serverKeyTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
-	tmpFiles.serverTrustTmp, err = ioutil.TempFile(os.TempDir(), "pre-")
+	tmpFiles.serverTrustTmp, err = os.CreateTemp(os.TempDir(), "pre-")
 	if err != nil {
 		return nil, err
 	}
@@ -496,11 +494,11 @@ func (tmpFiles *tmpCredsFiles) removeFiles() {
 }
 
 func copyFileContents(sourceFile, destinationFile string) error {
-	input, err := ioutil.ReadFile(sourceFile)
+	input, err := os.ReadFile(sourceFile)
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(destinationFile, input, 0644)
+	err = os.WriteFile(destinationFile, input, 0644)
 	if err != nil {
 		return err
 	}
@@ -555,7 +553,7 @@ func createProviders(tmpFiles *tmpCredsFiles) (certprovider.Provider, certprovid
 // Next, we change the identity certs that IdentityProvider is watching. Since
 // the identity key is not changed, the IdentityProvider should ignore the
 // update, and the connection should still be good.
-// Then the the identity key is changed. This time IdentityProvider should pick
+// Then the identity key is changed. This time IdentityProvider should pick
 // up the update, and the connection should fail, due to the trust certs on the
 // other side is not changed.
 // Finally, the trust certs that other-side's RootProvider is watching get
@@ -692,7 +690,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			}
 			// New connections should still be good, because the Provider didn't pick
 			// up the changes due to key-cert mismatch.
-			conn2, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 3", clientTLSCreds, false)
+			conn2, _, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 3", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -704,20 +702,21 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			// New connections should fail now, because the Provider picked the
 			// change, and *_cert_2.pem is not trusted by *_trust_cert_1.pem on the
 			// other side.
-			shortCtx, shortCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-			defer shortCancel()
-			conn3, greetClient, err := callAndVerifyWithClientConn(shortCtx, addr, "rpc call 4", clientTLSCreds, true)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), defaultTestTimeout)
+			conn3, _, err := callAndVerifyWithClientConn(ctx2, addr, "rpc call 4", clientTLSCreds, true)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer conn3.Close()
+			// Immediately cancel the context so the dialing won't drag the entire timeout still it stops.
+			cancel2()
 			// Make the trust cert change on the other side, and wait 1 second for
 			// the provider to pick up the change.
 			test.trustCertUpdateFunc()
 			time.Sleep(sleepInterval)
 			// New connections should be good, because the other side is using
 			// *_trust_cert_2.pem now.
-			conn4, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 5", clientTLSCreds, false)
+			conn4, _, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 5", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
