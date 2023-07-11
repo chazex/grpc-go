@@ -31,6 +31,13 @@ type ConnectivityStateEvaluator struct {
 	numIdle             uint64 // Number of addrConns in idle state.
 }
 
+// RecordTransition 记录SubConn的状态变更，并且基于此评估聚合状态应该是什么
+// - 如果至少一个SubConn是Ready，聚合状态是Ready (感觉和代码逻辑不太一样，至少有一个是Ready则Ready，如果两个都是Ready，那么应该就是Ready。但是代码两个都是Ready的话，-1 和 1相抵，和为0，返回connectivity.TransientFailure)
+// - Else if 至少一个SubConn是Connecting，聚合状态是Connecting (由于是Else if，所以前提是没有SubConn是Ready)
+// - Else if 至少一个SubConn是Idle，聚合状态是Idle
+// - Else if 至少一个SubConn状态是TransientFailure(或者没有SubConn)，聚合状态是Transient Failure
+// Shutdown不被考虑在内
+
 // RecordTransition records state change happening in subConn and based on that
 // it evaluates what aggregated state should be.
 //

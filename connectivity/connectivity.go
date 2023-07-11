@@ -57,8 +57,14 @@ const (
 	Connecting
 	// Ready indicates the ClientConn is ready for work.
 	Ready
+
+	// TransientFailure 表示连接遇到故障，但是会尝试去恢复
+
 	// TransientFailure indicates the ClientConn has seen a failure but expects to recover.
 	TransientFailure
+
+	// Shutdown 表示连接已经开始关闭。（结束了，不会尝试去再次恢复）
+
 	// Shutdown indicates the ClientConn has started shutting down.
 	Shutdown
 )

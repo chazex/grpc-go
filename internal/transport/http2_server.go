@@ -68,9 +68,10 @@ var serverConnectionCounter uint64
 
 // http2Server implements the ServerTransport interface with HTTP2.
 type http2Server struct {
-	lastRead    int64 // Keep this field 64-bit aligned. Accessed atomically.
-	ctx         context.Context
-	done        chan struct{}
+	lastRead int64 // Keep this field 64-bit aligned. Accessed atomically.
+	ctx      context.Context
+	done     chan struct{}
+	// HTTP2对应的TCP连接
 	conn        net.Conn
 	loopy       *loopyWriter
 	readerDone  chan struct{} // sync point to enable testing.
@@ -111,8 +112,9 @@ type http2Server struct {
 	// GoAway. During this time we don't want to write another first GoAway(with
 	// ID 2^31 -1) frame. Thus call to Drain() will be a no-op if drainEvent is
 	// already initialized since draining is already underway.
-	drainEvent    *grpcsync.Event
-	state         transportState
+	drainEvent *grpcsync.Event
+	state      transportState
+	// StreamID ->  Active Stream
 	activeStreams map[uint32]*Stream
 	// idle is the time instant when the connection went idle.
 	// This is either the beginning of the connection or when the number of
@@ -130,6 +132,8 @@ type http2Server struct {
 	// maxStreamMu guards the maximum stream ID
 	// This lock may not be taken if mu is already held.
 	maxStreamMu sync.Mutex
+
+	// 在连接上，出现过的最大的 stream ID。 因为http2的stream ID不能复用，所以只能递增。
 	maxStreamID uint32 // max stream ID ever seen
 
 	logger *grpclog.PrefixLogger
@@ -165,6 +169,9 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if config.MaxHeaderListSize != nil {
 		maxHeaderListSize = *config.MaxHeaderListSize
 	}
+
+	// 创建帧处理器，内部使用的是golang.org/x/net/http2
+	// framer 是基于TCP的，也就是所有的stream，都用的是一个framer
 	framer := newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize)
 	// Send initial settings as connection preface to client.
 	isettings := []http2.Setting{{
@@ -210,6 +217,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 			Val: *config.HeaderTableSize,
 		})
 	}
+
+	// 发送 SETTING Frame
 	if err := framer.fr.WriteSettings(isettings...); err != nil {
 		return nil, connectionErrorf(false, err, "transport: %v", err)
 	}
@@ -304,6 +313,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		}
 	}()
 
+	// 读取magic帧
 	// Check the validity of client preface.
 	preface := make([]byte, len(clientPreface))
 	if _, err := io.ReadFull(t.conn, preface); err != nil {
@@ -321,6 +331,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 	}
 
+	// 读取客户端的 SETTING Frame (这个帧必须时SETTING Frame)
 	frame, err := t.framer.fr.ReadFrame()
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		return nil, err
@@ -333,9 +344,11 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if !ok {
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 	}
+	// 处理SETTING帧
 	t.handleSettings(sf)
 
 	go func() {
+		// 开启协程，异步读取控制帧
 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger)
 		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
 		t.loopy.run()
@@ -366,6 +379,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		return nil
 	}
 
+	// 客户端 -> 服务端方向的 SteamID 必须是奇数，且 Stream ID不能复用，所以只能递增。
 	if streamID%2 != 1 || streamID <= t.maxStreamID {
 		// illegal gRPC stream id.
 		return fmt.Errorf("received an illegal stream id: %v. headers frame: %+v", streamID, frame)
@@ -379,6 +393,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		buf: buf,
 		fc:  &inFlow{limit: uint32(t.initialWindowSize)},
 	}
+	fmt.Println("创建一个新的流: ", streamID)
 	var (
 		// if false, content-type was missing or invalid
 		isGRPC      = false
@@ -420,6 +435,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		case ":method":
 			httpMethod = hf.Value
 		case ":path":
+			// path对应的是在proto中定义的请求路由。 包括service 和 method
 			s.method = hf.Value
 		case "grpc-timeout":
 			timeoutSet = true
@@ -538,6 +554,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		return nil
 	}
 	if uint32(len(t.activeStreams)) >= t.maxStreams {
+		// 并发的流太多了，拒绝掉新的
 		t.mu.Unlock()
 		t.controlBuf.put(&cleanupStream{
 			streamID: streamID,
@@ -585,6 +602,8 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 			return nil
 		}
 	}
+
+	// 将流保存到 互动流的map中
 	t.activeStreams[streamID] = s
 	if len(t.activeStreams) == 1 {
 		t.idle = time.Time{}
@@ -612,10 +631,14 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	}
 	s.ctxDone = s.ctx.Done()
 	s.wq = newWriteQuota(defaultWriteQuota, s.ctxDone)
+
+	// 给stream配置reader。
+	// 因为会把stream结构体传递到grpc处理逻辑的相关函数中，他是通过trReader来读取body数据，然后解码为proto中定义的XXXRequest
 	s.trReader = &transportReader{
 		reader: &recvBufferReader{
-			ctx:        s.ctx,
-			ctxDone:    s.ctxDone,
+			ctx:     s.ctx,
+			ctxDone: s.ctxDone,
+			// 收到data frame后，会通过调用recvBuffer.put()方法将pyload存到s.buf中(channel 通信方式)
 			recv:       s.buf,
 			freeBuffer: t.bufferPool.put,
 		},
@@ -628,6 +651,8 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		streamID: s.id,
 		wq:       s.wq,
 	})
+
+	// 将path映射到service/method，然后执行对应的业务方法。
 	handle(s)
 	return nil
 }
@@ -637,8 +662,10 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 // traceCtx attaches trace to ctx and returns the new context.
 func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.Context, string) context.Context) {
 	defer close(t.readerDone)
+	// 在http2的连接建立好后，循环读取帧
 	for {
 		t.controlBuf.throttle()
+		// 读取一个帧
 		frame, err := t.framer.fr.ReadFrame()
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
@@ -650,6 +677,7 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 				s := t.activeStreams[se.StreamID]
 				t.mu.Unlock()
 				if s != nil {
+					// 出现错误，关闭流
 					t.closeStream(s, true, se.Code, false)
 				} else {
 					t.controlBuf.put(&cleanupStream{
@@ -668,13 +696,18 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 			t.Close(err)
 			return
 		}
+		// 依据不同的帧，做不同的处理
 		switch frame := frame.(type) {
 		case *http2.MetaHeadersFrame:
+			// 对于每一次请求而言，client 一定会先发 HeadersFrame 这个帧，grpc 这里是直接使用 http2 工具包进行实现，直接处理的 MetaHeadersFrame 帧
+			// operateHeaders 每次会对SteamID，新创建一个对应的Stream
 			if err := t.operateHeaders(frame, handle, traceCtx); err != nil {
 				t.Close(err)
 				break
 			}
 		case *http2.DataFrame:
+			// 不会创建新建流，会依据Stream ID，找到对应的Stream，因为发送请求之前一定会先发送一个 header帧,在处理header帧的时候会创建流。
+			// 读取到的数据会放到 stream实例的 buf中.`
 			t.handleData(frame)
 		case *http2.RSTStreamFrame:
 			t.handleRSTStream(frame)
@@ -809,9 +842,11 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 		// guarantee f.Data() is consumed before the arrival of next frame.
 		// Can this copy be eliminated?
 		if len(f.Data()) > 0 {
+			// 将data frame 的payload写入buffer，然后将buffer构建成recvMsg，发送给Stream的buf。
 			buffer := t.bufferPool.get()
 			buffer.Reset()
 			buffer.Write(f.Data())
+			fmt.Println("put 一个数据帧: ", buffer.Len())
 			s.write(recvMsg{buffer: buffer})
 		}
 	}
@@ -1154,6 +1189,7 @@ func (t *http2Server) keepalive() {
 	for {
 		select {
 		case <-idleTimer.C:
+			// 一个连接最大空闲时间
 			t.mu.Lock()
 			idle := t.idle
 			if idle.IsZero() { // The connection is non-idle.
@@ -1171,6 +1207,7 @@ func (t *http2Server) keepalive() {
 			}
 			idleTimer.Reset(val)
 		case <-ageTimer.C:
+			// 一个连接最大的持续时间
 			t.Drain()
 			ageTimer.Reset(t.kp.MaxConnectionAgeGrace)
 			select {
@@ -1214,6 +1251,7 @@ func (t *http2Server) keepalive() {
 			kpTimeoutLeft -= sleepDuration
 			kpTimer.Reset(sleepDuration)
 		case <-t.done:
+			// http2连接被关闭
 			return
 		}
 	}
@@ -1223,6 +1261,12 @@ func (t *http2Server) keepalive() {
 // TODO(zhaoq): Now the destruction is not blocked on any pending streams. This
 // could cause some resource issue. Revisit this later.
 func (t *http2Server) Close(err error) {
+	// 关闭http2连接
+	// 1. 设置状态为closeing
+	// 2. 关闭done chan（有很多监听的）
+	// 3. 关闭tcp连接
+	// 4. 取消多有active stream
+
 	t.mu.Lock()
 	if t.state == closing {
 		t.mu.Unlock()

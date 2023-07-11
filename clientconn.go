@@ -654,7 +654,7 @@ func (cc *ClientConn) maybeApplyDefaultServiceConfig(addrs []resolver.Address) {
 	}
 }
 
-// 参数是resolver得到的服务地址列表，以及负载均衡配置
+// 参数s是resolver得到的服务地址列表，以及负载均衡配置
 
 func (cc *ClientConn) updateResolverState(s resolver.State, err error) error {
 	defer cc.firstResolveEvent.Fire()
@@ -1162,12 +1162,17 @@ type addrConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cc     *ClientConn
-	dopts  dialOptions
+	cc    *ClientConn
+	dopts dialOptions
+	// acBalancerWrapper
 	acbw   balancer.SubConn
 	scopts balancer.NewSubConnOptions
 
 	// 这里的transport实际上就是http2Client
+	// transport 在存在可用连接的时候才会被置（也就是说这个属性值!=nil时，它一定是可用的）（注意： state可能不是READY状态，
+	// 因为负载均衡器的健康检测需要server去报告健康，才能将ac的状态设置为 READY)，并在当前transport不应再被用于创建一个流时，重置为 nil。
+	//（例如，在收到 GoAway 后，transport被关闭，ac 已被拆除）
+
 	// transport is set when there's a viable transport (note: ac state may not be READY as LB channel
 	// health checking may require server to report healthy to set ac to READY), and is reset
 	// to nil when the current transport should no longer be used to create a stream (e.g. after GoAway
@@ -1178,6 +1183,7 @@ type addrConn struct {
 	curAddr resolver.Address   // The current address.
 	addrs   []resolver.Address // All addresses that the resolver resolved to.
 
+	// 连接的状态
 	// Use updateConnectivityState for updating addrConn's connectivity state.
 	state connectivity.State
 
@@ -1380,7 +1386,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 	defer cancel()
 	copts.ChannelzParentID = ac.channelzID
 
-	// 创建http2client(实现接口ClientTransport)
+	// 创建http2client(实现接口ClientTransport) 内部会发送 Magic帧和设置帧
 	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, addr, copts, onClose)
 	if err != nil {
 		if logger.V(2) {

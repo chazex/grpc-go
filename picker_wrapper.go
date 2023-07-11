@@ -83,7 +83,7 @@ func doneChannelzWrapper(acw *acBalancerWrapper, result *balancer.PickResult) {
 	}
 }
 
-// 在client调用rpc，做负载均衡时，就是从这里做pick动作，选择连接的。
+// 在client调用rpc，做负载均衡时，就是从这里做pick动作，选择连接的。拿到的连接就是acBalancerWrapper, 里面方的是addrConn
 
 // pick returns the transport that will be used for the RPC.
 // It may block in the following cases:

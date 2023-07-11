@@ -385,10 +385,12 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderList
 	if writeBufferSize < 0 {
 		writeBufferSize = 0
 	}
+	// 将底层的TCP连接，封装成带有buf的reader
 	var r io.Reader = conn
 	if readBufferSize > 0 {
 		r = bufio.NewReaderSize(r, readBufferSize)
 	}
+	// 将底层的TCP连接，封装成带有buf的writer
 	w := newBufWriter(conn, writeBufferSize)
 	f := &framer{
 		writer: w,

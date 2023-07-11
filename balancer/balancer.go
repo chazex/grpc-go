@@ -76,6 +76,17 @@ func Get(name string) Builder {
 	return nil
 }
 
+// SubConn 表示到 gRPC 后端服务的单个连接
+
+// 每个 SubConn 都包含一个地址列表。 （为什么会是地址列表呢？）
+
+// 所有 SubConns 都以 IDLE 状态 启动，并不会尝试去做连接操作。要触发连接的建立，负载均衡器必须调用 Connect方法。
+// 如果连接重新进入 IDLE 状态，负载均衡器器必须再次调用 Connect 以触发新的连接尝试。
+
+// gRPC 将尝试按顺序对地址列表进行连接，并在第一次连接成功后停止尝试其余地址。如果连接到所有地址的尝试遇到错误，SubConn 将进入 TRANSIENT_FAILURE 状态，并且有一个退避期，退避期后，然后转换为 IDLE状态（IDLE状态会再次做连接）。
+
+// 一旦建立，如果连接丢失，SubConn 将直接进入IDLE(后面会对IDLE重连)。
+
 // A SubConn represents a single connection to a gRPC backend service.
 //
 // Each SubConn contains a list of addresses.
@@ -97,6 +108,8 @@ func Get(name string) Builder {
 // implementations should embed this interface. This allows gRPC to add new
 // methods to this interface.
 type SubConn interface {
+	// UpdateAddresses 此方法已经过期，放在 ClientConn 接口中了。
+
 	// UpdateAddresses updates the addresses used in this SubConn.
 	// gRPC checks if currently-connected address is still in the new list.
 	// If it's in the list, the connection will be kept.
@@ -416,59 +429,6 @@ type ProducerBuilder interface {
 	Build(grpcClientConnInterface interface{}) (p Producer, close func())
 }
 
-/*
-<<<<<<< HEAD
-// RecordTransition 记录SubConn的状态变更，并且基于此评估聚合状态应该是什么
-// - 如果至少一个SubConn是Ready，聚合状态是Ready (感觉和代码逻辑不太一样，至少有一个是Ready则Ready，如果两个都是Ready，那么应该就是Ready。但是代码两个都是Ready的话，-1 和 1相抵，和为0，返回connectivity.TransientFailure)
-// - Else if 至少一个SubConn是Connecting，聚合状态是Connecting (由于是Else if，所以前提是没有SubConn是Ready)
-// - Else if 至少一个SubConn状态是TransientFailure，聚合状态是Transient Failure
-// - Else if 至少一个SubConn是Idle，聚合状态是Idle
-// - Else 没有SubConn，聚合状态是Transient Failure
-// Shutdown不被考虑在内
-
-// RecordTransition records state change happening in subConn and based on that
-// it evaluates what aggregated state should be.
-//
-//  - If at least one SubConn in Ready, the aggregated state is Ready;
-//  - Else if at least one SubConn in Connecting, the aggregated state is Connecting;
-//  - Else if at least one SubConn is TransientFailure, the aggregated state is Transient Failure;
-//  - Else if at least one SubConn is Idle, the aggregated state is Idle;
-//  - Else there are no subconns and the aggregated state is Transient Failure
-//
-// Shutdown is not considered.
-func (cse *ConnectivityStateEvaluator) RecordTransition(oldState, newState connectivity.State) connectivity.State {
-	// cse.numReady cse.numConnecting cse.numTransientFailure cse.numIdle 是服务发现到的多个连接累加的，这一点开始没注意到。 卡了很久
-	// Update counters.
-	for idx, state := range []connectivity.State{oldState, newState} {
-		updateVal := 2*uint64(idx) - 1 // -1 for oldState and +1 for new.
-		switch state {
-		case connectivity.Ready:
-			cse.numReady += updateVal
-		case connectivity.Connecting:
-			cse.numConnecting += updateVal
-		case connectivity.TransientFailure:
-			cse.numTransientFailure += updateVal
-		case connectivity.Idle:
-			cse.numIdle += updateVal
-		}
-	}
-
-	// Evaluate.
-	if cse.numReady > 0 {
-		return connectivity.Ready
-	}
-	if cse.numConnecting > 0 {
-		return connectivity.Connecting
-	}
-	if cse.numTransientFailure > 0 {
-		return connectivity.TransientFailure
-	}
-	if cse.numIdle > 0 {
-		return connectivity.Idle
-	}
-	return connectivity.TransientFailure
-=======
-*/
 // A Producer is a type shared among potentially many consumers.  It is
 // associated with a SubConn, and an implementation will typically contain
 // other methods to provide additional functionality, e.g. configuration or

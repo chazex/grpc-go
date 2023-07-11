@@ -483,13 +483,14 @@ type loopyWriter struct {
 	// Each of these streams internally have a list of data items(and perhaps trailers
 	// on the server-side) to be sent out.
 	activeStreams *outStreamList
-	framer        *framer
-	hBuf          *bytes.Buffer  // The buffer for HPACK encoding.
-	hEnc          *hpack.Encoder // HPACK encoder.
-	bdpEst        *bdpEstimator
-	draining      bool
-	conn          net.Conn
-	logger        *grpclog.PrefixLogger
+	// 帧处理器，在一个TCP连接之上的所有stream共用一个。
+	framer   *framer
+	hBuf     *bytes.Buffer  // The buffer for HPACK encoding.
+	hEnc     *hpack.Encoder // HPACK encoder.
+	bdpEst   *bdpEstimator
+	draining bool
+	conn     net.Conn
+	logger   *grpclog.PrefixLogger
 
 	// Side-specific handlers
 	ssGoAwayHandler func(*goAway) (bool, error)

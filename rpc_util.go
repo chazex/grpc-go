@@ -569,6 +569,8 @@ const (
 
 // parser reads complete gRPC messages from the underlying reader.
 type parser struct {
+	// 这个reader，我记得应该是stream对象封装的
+
 	// r is the underlying reader.
 	// See the comment on recvMsg for the permissible
 	// error types.
@@ -594,6 +596,9 @@ type parser struct {
 // that the underlying io.Reader must not return an incompatible
 // error.
 func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byte, err error) {
+	// 从stream中读取数据，先读取5个字节 grpc message
+	// 第一个字节是是否压缩
+	// 后面4个字节是长度
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -613,6 +618,7 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 	// TODO(bradfitz,zhaoq): garbage. reuse buffer after proto decoding instead
 	// of making it for each message:
 	msg = make([]byte, int(length))
+	// 调用Stream.Read()方法，它内部通过io.ReadFull方法，就是将msg读满，都不满会报错
 	if _, err := p.r.Read(msg); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -725,7 +731,11 @@ type payloadInfo struct {
 	uncompressedBytes []byte
 }
 
+// streaming rpc 和 unary rpc 都会用这个方法来获取消息
+
 func recvAndDecompress(p *parser, s *transport.Stream, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor) ([]byte, error) {
+	// pf 是否压缩
+	// d 消息内容
 	pf, d, err := p.recvMsg(maxReceiveMessageSize)
 	if err != nil {
 		return nil, err

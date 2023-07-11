@@ -262,6 +262,11 @@ func (gsb *Balancer) Close() {
 	pendingBalancerToClose.Close()
 }
 
+// balancerWrapper 是对负载均衡器的封装（对真正负载均衡器的封装，比如baseBalancer)，并且重写了一些负载均衡器的方法，以便清理由被包装的负载均衡器所创建的连接。
+
+// 它实现了balancer.ClientConn接口.... 它维护了由被包装的负载均衡器所创建子链接集合，
+// 被包装的负载均衡器的状态更新可能会导致调用优雅的切换逻辑。
+
 // balancerWrapper wraps a balancer.Balancer, and overrides some Balancer
 // methods to help cleanup SubConns created by the wrapped balancer.
 //
@@ -276,7 +281,8 @@ type balancerWrapper struct {
 	gsb *Balancer
 
 	lastState balancer.State
-	subconns  map[balancer.SubConn]bool // subconns created by this balancer
+	// 由负载均衡器所创建的子链接
+	subconns map[balancer.SubConn]bool // subconns created by this balancer
 }
 
 func (bw *balancerWrapper) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {

@@ -110,6 +110,8 @@ func (b *recvBuffer) put(r recvMsg) {
 		return
 	}
 	b.err = r.err
+	// 当backlog为空时（此时表示channel有极大可能为空），则优先写入channel。 channel写入失败后，才写入backlog
+	// backlog不为空，则必须写入backlog，因为写入channel会顺序错乱
 	if len(b.backlog) == 0 {
 		select {
 		case b.c <- r:
@@ -125,6 +127,7 @@ func (b *recvBuffer) put(r recvMsg) {
 func (b *recvBuffer) load() {
 	b.mu.Lock()
 	if len(b.backlog) > 0 {
+		// 将backlog 里的数据转到 b.c的channel中
 		select {
 		case b.c <- b.backlog[0]:
 			b.backlog[0] = recvMsg{}
@@ -159,10 +162,12 @@ type recvBufferReader struct {
 // read additional data from recv. It blocks if there no additional data available
 // in recv. If Read returns any non-nil error, it will continue to return that error.
 func (r *recvBufferReader) Read(p []byte) (n int, err error) {
+	fmt.Println("recvBufferReader： ")
 	if r.err != nil {
 		return 0, r.err
 	}
 	if r.last != nil {
+		// 优先从上次剩余的读
 		// Read remaining data left in last call.
 		copied, _ := r.last.Read(p)
 		if r.last.Len() == 0 {
@@ -171,6 +176,7 @@ func (r *recvBufferReader) Read(p []byte) (n int, err error) {
 		}
 		return copied, nil
 	}
+	// 上次没剩余，则从channel里面阻塞式的拿到 data frame的payload（或者超时），然后读取
 	if r.closeStream != nil {
 		n, r.err = r.readClient(p)
 	} else {
@@ -184,6 +190,7 @@ func (r *recvBufferReader) read(p []byte) (n int, err error) {
 	case <-r.ctxDone:
 		return 0, ContextErr(r.ctx.Err())
 	case m := <-r.recv.get():
+		// r.recv 其实就是Stream.RecvBuffer， data frame的payload会构建成一个recvMsg，发送到这个channel里面。
 		return r.readAdditional(m, p)
 	}
 }
@@ -220,11 +227,16 @@ func (r *recvBufferReader) readAdditional(m recvMsg, p []byte) (n int, err error
 	if m.err != nil {
 		return 0, m.err
 	}
+	// 将p读满就可以，读满还有剩余的话，存到last里面.
+	// 这里忽略了io.EOF错误，因为EOF错误只是代表一个frame的payload被读完了，可能p并没有读满，后面还会有其他的frame到来，后面会再次调用这个函数，继续读就可以了。
+	// 如果在TCP层的io.EOF，怎么处理的？ ctx？
 	copied, _ := m.buffer.Read(p)
 	if m.buffer.Len() == 0 {
+		// 读取之后变成空了， 则始放掉
 		r.freeBuffer(m.buffer)
 		r.last = nil
 	} else {
+		// 如果还有剩余，则保存下来，下次优先从这里读
 		r.last = m.buffer
 	}
 	return copied, nil
@@ -488,6 +500,7 @@ func (s *Stream) write(m recvMsg) {
 	s.buf.put(m)
 }
 
+// 从流上读取一定数量的字节
 // Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
 	// Don't request a read if there was an error earlier

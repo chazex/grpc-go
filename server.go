@@ -534,6 +534,8 @@ func HeaderTableSize(s uint32) ServerOption {
 	})
 }
 
+// 设置 worker goroutines的数量，worker goroutines用来处理流。如果设置为0，将关闭workers，此时每一个流使用一个goroutines
+
 // NumStreamWorkers returns a ServerOption that sets the number of worker
 // goroutines that should be used to process incoming streams. Setting this to
 // zero (default) will disable workers and spawn a new goroutine for each
@@ -600,10 +602,13 @@ func (s *Server) stopServerWorkers() {
 // NewServer creates a gRPC server which has no service registered and has not
 // started to accept requests yet.
 func NewServer(opt ...ServerOption) *Server {
+	// 1. 默认配置
 	opts := defaultServerOptions
+	// 2. 全局配置
 	for _, o := range globalServerOptions {
 		o.apply(&opts)
 	}
+	// 3. 用户传入配置
 	for _, o := range opt {
 		o.apply(&opts)
 	}
@@ -624,6 +629,7 @@ func NewServer(opt ...ServerOption) *Server {
 		s.events = trace.NewEventLog("grpc.Server", fmt.Sprintf("%s:%d", file, line))
 	}
 
+	// 初始化worker池(worker用来处理 stream)
 	if s.opts.numServerWorkers > 0 {
 		s.initServerWorkers()
 	}
@@ -883,6 +889,10 @@ func (s *Server) Serve(lis net.Listener) error {
 	}
 }
 
+// 开启一个协程处理刚刚Accept的TCP连接，此时，这个连接上还没有任何的I/O
+// 并在这个TCP连接之上，创建http2的连接（这里一个TCP连接之上，只创建一个http2连接【好像也只能创建一个】）
+// 再起一个协程，用来处理http2之上的数据（stream 和 frame）
+
 // handleRawConn forks a goroutine to handle a just-accepted connection that
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
@@ -892,7 +902,7 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	}
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
 
-	// 创建http2连接，实际上是(*http2Server)
+	// 创建http2连接，实际上是(*http2Server), 里面接收了 MAGIC Frame and SETTING Frame
 	// Finish handshaking (HTTP2)
 	st := s.newHTTP2Transport(rawConn)
 	rawConn.SetDeadline(time.Time{})
@@ -969,6 +979,7 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 	st.HandleStreams(func(stream *transport.Stream) {
 		wg.Add(1)
 		if s.opts.numServerWorkers > 0 {
+			// 配置了worker池
 			data := &serverWorkerData{st: st, wg: &wg, stream: stream}
 			select {
 			case s.serverWorkerChannels[atomic.AddUint32(&roundRobinCounter, 1)%s.opts.numServerWorkers] <- data:
@@ -980,6 +991,7 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 				}()
 			}
 		} else {
+			// 没使用worker池，此时每一个stream，都是用一个新的协程来处理
 			go func() {
 				defer wg.Done()
 				s.handleStream(st, stream, s.traceInfo(st, stream))
@@ -1325,6 +1337,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 	if len(shs) != 0 || len(binlogs) != 0 {
 		payInfo = &payloadInfo{}
 	}
+	// 获取 request body
 	d, err := recvAndDecompress(&parser{r: stream}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
 	if err != nil {
 		if e := t.WriteStatus(stream, status.Convert(err)); e != nil {
@@ -1335,7 +1348,10 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 	if channelz.IsOn() {
 		t.IncrMsgRecv()
 	}
+	// df函数，用于将数据 解析为 proto文件中的XXXRequest， v就是XXXRequest
 	df := func(v interface{}) error {
+		// 根据 ContentSubtype 来获取解码器。 ContentSubtype 一般是proto
+		// 其中d 应该就是 Data Frame 的payload.
 		if err := s.getCodec(stream.ContentSubtype()).Unmarshal(d, v); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
 		}
@@ -1363,7 +1379,8 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 		return nil
 	}
 	ctx := NewContextWithServerTransportStream(stream.Context(), stream)
-	// 调用请求对应的方法（proto文件生成的文件中）
+	// 调用请求对应的方法（Handler是在proto文件生成的go文件中， 如_Echo_UnaryEcho_Handler）
+	// df参数，用于将数据解析为 proto文件中的XXXRequest
 	reply, appErr := md.Handler(info.serviceImpl, ctx, df, s.opts.unaryInt)
 	if appErr != nil {
 		// 方法返回了error时，转换成grpc的status
@@ -1661,6 +1678,11 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 		server = info.serviceImpl
 	}
 	if s.opts.streamInt == nil {
+		// 调用业务方法
+		// Handler 是 _Echo_ClientStreamingEcho_Handler
+		// ss 是 grpc.ServerStream 的实现 serverStream
+		// server 是具体的业务实现
+		// 里面会调用 ss.SendMsg(*EchoResponse)  和 ss.RecvMsg(*EchoRequest)
 		appErr = sd.Handler(server, ss)
 	} else {
 		info := &StreamServerInfo{
@@ -1711,16 +1733,19 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 			binlog.Log(stream.Context(), st)
 		}
 	}
+	// 返回成功码
 	return t.WriteStatus(ss.s, statusOK)
 }
 
-// 处理请求
+// 处理请求: 从stream中提取到service 和 method(实际取自于header帧)，然后找到对应的注册在server中的方法去处理。
 // t http2连接
 func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream, trInfo *traceInfo) {
 	sm := stream.Method()
 	if sm != "" && sm[0] == '/' {
 		sm = sm[1:]
 	}
+
+	// 请求的gRPC路由不能以"/"结尾
 	pos := strings.LastIndex(sm, "/")
 	if pos == -1 {
 		if trInfo != nil {
@@ -1740,22 +1765,25 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Str
 		}
 		return
 	}
+	// 从路由中获取service和method
 	service := sm[:pos]
 	method := sm[pos+1:]
 
 	srv, knownService := s.services[service]
 	if knownService {
 		if md, ok := srv.methods[method]; ok {
-			// 处理unary rpc请求
+			// 处理unary rpc请求,并在stream上，发送 response
 			s.processUnaryRPC(t, stream, srv, md, trInfo)
 			return
 		}
 		if sd, ok := srv.streams[method]; ok {
-			// 处理stream rpc
+			// 处理stream rpc,并在stream上，发送 response
 			s.processStreamingRPC(t, stream, srv, sd, trInfo)
 			return
 		}
 	}
+
+	// 如果没有在注册map中，找到对应的service & method，那么用默认的处理方法
 	// Unknown service, or known server unknown method.
 	if unknownDesc := s.opts.unknownStreamDesc; unknownDesc != nil {
 		s.processStreamingRPC(t, stream, nil, unknownDesc, trInfo)

@@ -33,6 +33,7 @@ type EchoClient interface {
 }
 
 type echoClient struct {
+	// cc 是grpc.ClientConn
 	cc grpc.ClientConnInterface
 }
 

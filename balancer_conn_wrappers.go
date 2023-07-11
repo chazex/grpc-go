@@ -397,6 +397,8 @@ func (ccb *ccBalancerWrapper) Target() string {
 	return ccb.cc.target
 }
 
+// acBalancerWrapper 是addrConn之上，用于负载均衡器的一个封装
+
 // acBalancerWrapper is a wrapper on top of ac for balancers.
 // It implements balancer.SubConn interface.
 type acBalancerWrapper struct {
@@ -409,10 +411,13 @@ func (acbw *acBalancerWrapper) UpdateAddresses(addrs []resolver.Address) {
 	acbw.mu.Lock()
 	defer acbw.mu.Unlock()
 	if len(addrs) <= 0 {
+		// 新地址列表为空
 		acbw.ac.cc.removeAddrConn(acbw.ac, errConnDrain)
 		return
 	}
 	if !acbw.ac.tryUpdateAddrs(addrs) {
+		// 需要重新创建连接
+
 		cc := acbw.ac.cc
 		opts := acbw.ac.scopts
 		acbw.ac.mu.Lock()
@@ -427,6 +432,8 @@ func (acbw *acBalancerWrapper) UpdateAddresses(addrs []resolver.Address) {
 		acbw.ac.cc.removeAddrConn(acbw.ac, errConnDrain)
 
 		if acState == connectivity.Shutdown {
+			// 老的连接状态已经是Shutdown
+			// 这里为什么没有更新addrs？ 因为Shutdown的addrConn不会再被使用吗?
 			return
 		}
 
